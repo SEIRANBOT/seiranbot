@@ -1,9 +1,13 @@
+
 import os
+import json
 import asyncio
 import logging
-from datetime import datetime, timezone
+import time
+from collections import defaultdict
 
-from aiohttp import web, ClientSession, ClientTimeout
+import aiohttp
+from aiohttp import web
 from telegram import Update
 from telegram.ext import (
     Application,
@@ -11,38 +15,247 @@ from telegram.ext import (
     ContextTypes,
 )
 
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(message)s"
+)
 
 TOKEN = os.getenv("BOT_TOKEN")
 PORT = int(os.getenv("PORT", "10000"))
-MARKET_DATA_URL = "https://data-api.binance.vision"
+
+SYMBOLS = [
+    "BTCUSDT", "ETHUSDT", "BNBUSDT", "SOLUSDT",
+    "XRPUSDT", "ADAUSDT", "DOGEUSDT", "TRXUSDT",
+    "LINKUSDT", "AVAXUSDT", "LTCUSDT", "DOTUSDT",
+    "BCHUSDT", "ETCUSDT", "NEARUSDT", "ATOMUSDT",
+    "UNIUSDT", "APTUSDT", "FILUSDT", "SUIUSDT"
+]
+
+BASE_URL = "https://data-api.binance.vision"
+STREAM_URL = "wss://stream.binance.com:9443/stream"
+
+session = None
+ws_task = None
+health_runner = None
+
+prices = {}
+candles = defaultdict(list)
+history_loaded = set()
+history_retry_at = {}
 
 
-async def get_market_json(path: str, params: dict):
-    timeout = ClientTimeout(total=15)
-    async with ClientSession(timeout=timeout) as session:
+def normalize_symbol(value):
+    symbol = value.upper().replace("/", "").replace("-", "")
+    if not symbol.endswith("USDT"):
+        symbol += "USDT"
+    return symbol
+
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "SEIRANBOT запущен!\n\n"
+        "Режим: ДЕМО\n"
+        "Данные: Binance WebSocket\n\n"
+        "Команды:\n"
+        "/price BTCUSDT — цена\n"
+        "/candles BTCUSDT — последние свечи\n"
+        "/analysis BTCUSDT — анализ рынка\n"
+        "/help — помощь"
+    )
+
+
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "SEIRANBOT — анализ криптовалют.\n\n"
+        "Примеры:\n"
+        "/price BTCUSDT\n"
+        "/candles ETHUSDT\n"
+        "/analysis BTCUSDT\n\n"
+        "Сигналы не гарантируют прибыль.\n"
+        "Реальные сделки бот не открывает."
+    )
+
+
+async def websocket_worker():
+    streams = "/".join(
+        f"{symbol.lower()}@kline_1m" for symbol in SYMBOLS
+    )
+    url = f"{STREAM_URL}?streams={streams}"
+
+    while True:
+        try:
+            logging.info("Подключение к Binance WebSocket")
+            async with session.ws_connect(
+                url, heartbeat=30
+            ) as ws:
+                logging.info("Binance WebSocket подключён")
+
+                async for msg in ws:
+                    if msg.type != aiohttp.WSMsgType.TEXT:
+                        continue
+
+                    try:
+                        payload = json.loads(msg.data)
+                        data = payload.get("data", {})
+                        k = data.get("k", {})
+
+                        symbol = data.get("s")
+                        if not symbol:
+                            continue
+
+                        price = float(k["c"])
+                        prices[symbol] = price
+
+                        if k.get("x"):
+                            candle = {
+                                "t": int(k["t"]),
+                                "o": float(k["o"]),
+                                "h": float(k["h"]),
+                                "l": float(k["l"]),
+                                "c": float(k["c"]),
+                                "v": float(k["v"]),
+                            }
+
+                            history = candles[symbol]
+
+                            if not history or history[-1]["t"] != candle["t"]:
+                                history.append(candle)
+                            else:
+                                history[-1] = candle
+
+                            candles[symbol] = history[-200:]
+
+                    except (ValueError, KeyError, TypeError):
+                        continue
+
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:
+            logging.warning("WebSocket отключён: %s", error)
+            await asyncio.sleep(5)
+
+
+async def load_history(symbol):
+    if symbol in history_loaded:
+        return True
+
+    if time.time() < history_retry_at.get(symbol, 0):
+        return False
+
+    history_retry_at[symbol] = time.time() + 300
+
+    url = f"{BASE_URL}/api/v3/klines"
+    params = {
+        "symbol": symbol,
+        "interval": "1m",
+        "limit": 200
+    }
+
+    try:
         async with session.get(
-            f"{MARKET_DATA_URL}{path}", params=params
+            url, params=params, timeout=15
         ) as response:
+
             if response.status != 200:
                 body = await response.text()
-                raise RuntimeError(
-                    f"Binance HTTP {response.status}: {body[:200]}"
+                logging.warning(
+                    "Binance HTTP %s: %s",
+                    response.status, body[:300]
                 )
-            return await response.json()
+                return False
+
+            data = await response.json()
+            now_ms = int(time.time() * 1000)
+
+            loaded = []
+            for item in data:
+                if int(item[6]) < now_ms:
+                    loaded.append({
+                        "t": int(item[0]),
+                        "o": float(item[1]),
+                        "h": float(item[2]),
+                        "l": float(item[3]),
+                        "c": float(item[4]),
+                        "v": float(item[5]),
+                    })
+
+            candles[symbol] = loaded[-200:]
+            history_loaded.add(symbol)
+            return True
+
+    except Exception as error:
+        logging.warning("Ошибка загрузки истории: %s", error)
+        return False
 
 
-def normalize_symbol(raw: str) -> str:
-    return raw.strip().upper().replace("/", "").replace("-", "")
+async def price_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        await update.message.reply_text("Пример: /price BTCUSDT")
+        return
+
+    symbol = normalize_symbol(context.args[0])
+
+    if symbol not in SYMBOLS:
+        await update.message.reply_text(
+            "Пока эта пара не подключена. Используй основные USDT-пары."
+        )
+        return
+
+    price = prices.get(symbol)
+
+    if price is None:
+        await update.message.reply_text(
+            "Ожидаю данные Binance WebSocket. Попробуй через несколько секунд."
+        )
+        return
+
+    await update.message.reply_text(
+        f"{symbol}\nЦена: {price:.8f}\nИсточник: Binance WebSocket"
+    )
+
+
+async def candles_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        await update.message.reply_text("Пример: /candles BTCUSDT")
+        return
+
+    symbol = normalize_symbol(context.args[0])
+
+    if symbol not in SYMBOLS:
+        await update.message.reply_text("Эта пара пока не подключена.")
+        return
+
+    if not await load_history(symbol):
+        await update.message.reply_text(
+            "Не удалось загрузить историю Binance. "
+            "Возможно, действует ограничение API. "
+            "Не повторяй запрос часто — попробуй позже."
+        )
+        return
+
+    history = candles[symbol][-5:]
+
+    if not history:
+        await update.message.reply_text("Пока нет закрытых свечей.")
+        return
+
+    result = [f"ПОСЛЕДНИЕ СВЕЧИ — {symbol}"]
+
+    for c in history:
+        color = "🟢 ЗЕЛЁНАЯ" if c["c"] >= c["o"] else "🔴 КРАСНАЯ"
+        result.append(
+            f"O: {c['o']:.6f} | C: {c['c']:.6f} | {color}"
+        )
+
+    await update.message.reply_text("\n".join(result))
 
 
 def ema(values, period):
     if len(values) < period:
-        raise ValueError("Недостаточно данных для EMA")
+        return None
 
-    multiplier = 2 / (period + 1)
     result = sum(values[:period]) / period
+    multiplier = 2 / (period + 1)
 
     for value in values[period:]:
         result = (value - result) * multiplier + result
@@ -51,27 +264,19 @@ def ema(values, period):
 
 
 def calculate_rsi(values, period=14):
-    if len(values) <= period:
-        raise ValueError("Недостаточно данных для RSI")
+    if len(values) < period + 1:
+        return None
 
     changes = [
         values[i] - values[i - 1]
         for i in range(1, len(values))
     ]
 
-    gains = [max(change, 0) for change in changes]
-    losses = [max(-change, 0) for change in changes]
+    gains = [max(x, 0) for x in changes[-period:]]
+    losses = [max(-x, 0) for x in changes[-period:]]
 
-    avg_gain = sum(gains[:period]) / period
-    avg_loss = sum(losses[:period]) / period
-
-    for i in range(period, len(gains)):
-        avg_gain = (
-            avg_gain * (period - 1) + gains[i]
-        ) / period
-        avg_loss = (
-            avg_loss * (period - 1) + losses[i]
-        ) / period
+    avg_gain = sum(gains) / period
+    avg_loss = sum(losses) / period
 
     if avg_loss == 0:
         return 100.0
@@ -80,261 +285,136 @@ def calculate_rsi(values, period=14):
     return 100 - (100 / (1 + rs))
 
 
-def calculate_macd(values):
-    if len(values) < 40:
-        raise ValueError("Недостаточно данных для MACD")
-
-    multiplier_fast = 2 / 13
-    multiplier_slow = 2 / 27
-
-    fast = sum(values[:12]) / 12
-    slow = sum(values[:26]) / 26
-
-    macd_values = []
-
-    for i, value in enumerate(values):
-        if i >= 12:
-            fast = (
-                value - fast
-            ) * multiplier_fast + fast
-
-        if i >= 26:
-            slow = (
-                value - slow
-            ) * multiplier_slow + slow
-            macd_values.append(fast - slow)
-
-    signal = ema(macd_values, 9)
-    return macd_values[-1], signal
-
-
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "SEIRANBOT запущен!\n"
-        "Режим: DEMO MODE\n"
-        "Торговля: только демо.\n"
-        "Рыночные данные: Binance Spot."
-    )
-
-
-async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "SEIRANBOT — помощь\n\n"
-        "/start — запуск\n"
-        "/help — помощь\n"
-        "/price BTCUSDT — текущая цена\n"
-        "/candles BTCUSDT — последние 5 свечей\n"
-        "/analysis BTCUSDT — технический анализ\n\n"
-        "Индикаторы: EMA 20/50, RSI 14, MACD.\n"
-        "Режим: DEMO MODE. Сделки не открываются."
-    )
-
-
-async def price_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def analysis_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
-        await update.message.reply_text(
-            "Пример: /price BTCUSDT"
-        )
+        await update.message.reply_text("Пример: /analysis BTCUSDT")
         return
 
     symbol = normalize_symbol(context.args[0])
 
-    if not symbol.isalnum() or not 6 <= len(symbol) <= 20:
-        await update.message.reply_text("Неверный формат пары.")
+    if symbol not in SYMBOLS:
+        await update.message.reply_text("Эта пара пока не подключена.")
         return
 
-    try:
-        data = await get_market_json(
-            "/api/v3/ticker/price",
-            {"symbol": symbol},
-        )
-
+    if not await load_history(symbol):
         await update.message.reply_text(
-            f"РЫНОЧНАЯ КОТИРОВКА\n"
-            f"Пара: {data['symbol']}\n"
-            f"Цена: {data['price']}\n"
-            f"Источник: Binance Spot\n"
-            f"Режим: без торговли."
-        )
-
-    except Exception as exc:
-        logger.exception("Ошибка получения цены")
-        await update.message.reply_text(
-            f"Не удалось получить цену.\n{str(exc)[:200]}"
-        )
-
-
-async def candles_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not context.args:
-        await update.message.reply_text(
-            "Пример: /candles BTCUSDT"
+            "Не удалось получить историю для анализа. "
+            "Возможно, Binance временно ограничил API. Попробуй позже."
         )
         return
 
-    symbol = normalize_symbol(context.args[0])
+    history = candles[symbol]
 
-    if not symbol.isalnum() or not 6 <= len(symbol) <= 20:
-        await update.message.reply_text("Неверный формат пары.")
+    if len(history) < 55:
+        await update.message.reply_text("Недостаточно свечей для анализа.")
         return
 
-    try:
-        data = await get_market_json(
-            "/api/v3/klines",
-            {
-                "symbol": symbol,
-                "interval": "1m",
-                "limit": 6,
-            },
-        )
+    values = [c["c"] for c in history]
 
-        closed = data[:-1][-5:]
-        lines = []
+    ema20 = ema(values, 20)
+    ema50 = ema(values, 50)
+    rsi = calculate_rsi(values)
 
-        for candle in closed:
-            open_price = float(candle[1])
-            close_price = float(candle[4])
-            direction = (
-                "ЗЕЛЁНАЯ"
-                if close_price >= open_price
-                else "КРАСНАЯ"
-            )
-            candle_time = datetime.fromtimestamp(
-                candle[0] / 1000,
-                tz=timezone.utc,
-            ).strftime("%H:%M UTC")
+    fast = ema(values, 12)
+    slow = ema(values, 26)
+    macd = fast - slow
 
-            lines.append(
-                f"{candle_time} | O: {open_price} "
-                f"| C: {close_price} | {direction}"
-            )
+    score = 0
+    if ema20 > ema50:
+        score += 1
+    else:
+        score -= 1
 
-        await update.message.reply_text(
-            f"ПОСЛЕДНИЕ 5 ЗАКРЫТЫХ СВЕЧЕЙ — {symbol}\n"
-            + "\n".join(lines)
-            + "\nИсточник: Binance Spot."
-        )
+    if rsi is not None:
+        if rsi > 55:
+            score += 1
+        elif rsi < 45:
+            score -= 1
 
-    except Exception as exc:
-        logger.exception("Ошибка получения свечей")
-        await update.message.reply_text(
-            f"Не удалось получить свечи.\n{str(exc)[:200]}"
-        )
+    if macd > 0:
+        score += 1
+    else:
+        score -= 1
 
-
-async def analysis_command(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-):
-    if not context.args:
-        await update.message.reply_text(
-            "Пример: /analysis BTCUSDT"
-        )
-        return
-
-    symbol = normalize_symbol(context.args[0])
-
-    if not symbol.isalnum() or not 6 <= len(symbol) <= 20:
-        await update.message.reply_text("Неверный формат пары.")
-        return
+    if score >= 2:
+        signal = "BUY 🟢"
+    elif score <= -2:
+        signal = "SELL 🔴"
+    else:
+        signal = "WAIT 🟡"
 
     await update.message.reply_text(
-        f"Анализирую {symbol}..."
+        f"АНАЛИЗ {symbol}\n\n"
+        f"Цена: {values[-1]:.8f}\n"
+        f"EMA 20: {ema20:.8f}\n"
+        f"EMA 50: {ema50:.8f}\n"
+        f"RSI 14: {rsi:.2f}\n"
+        f"MACD: {macd:.8f}\n\n"
+        f"Сигнал: {signal}\n"
+        f"Оценка: {score}/3\n\n"
+        "Режим: ДЕМО. Сделки автоматически не открываются."
     )
-
-    try:
-        data = await get_market_json(
-            "/api/v3/klines",
-            {
-                "symbol": symbol,
-                "interval": "1m",
-                "limit": 200,
-            },
-        )
-
-        closed = data[:-1]
-        prices = [float(candle[4]) for candle in closed]
-
-        if len(prices) < 60:
-            raise ValueError("Недостаточно закрытых свечей")
-
-        ema20 = ema(prices, 20)
-        ema50 = ema(prices, 50)
-        rsi14 = calculate_rsi(prices, 14)
-        macd_value, macd_signal = calculate_macd(prices)
-
-        trend_up = ema20 > ema50
-        trend_down = ema20 < ema50
-        momentum_up = macd_value > macd_signal
-        momentum_down = macd_value < macd_signal
-
-        if trend_up and momentum_up and rsi14 > 50:
-            signal = "BUY"
-            explanation = "Тренд и импульс направлены вверх."
-        elif trend_down and momentum_down and rsi14 < 50:
-            signal = "SELL"
-            explanation = "Тренд и импульс направлены вниз."
-        else:
-            signal = "WAIT"
-            explanation = "Индикаторы не дают согласованного сигнала."
-
-        await update.message.reply_text(
-            f"ТЕХНИЧЕСКИЙ АНАЛИЗ — {symbol}\n\n"
-            f"Цена закрытия: {prices[-1]:.8f}\n"
-            f"EMA 20: {ema20:.8f}\n"
-            f"EMA 50: {ema50:.8f}\n"
-            f"RSI 14: {rsi14:.2f}\n"
-            f"MACD: {macd_value:.8f}\n"
-            f"MACD Signal: {macd_signal:.8f}\n\n"
-            f"Результат: {signal}\n"
-            f"{explanation}\n\n"
-            f"Источник: Binance Spot, свечи 1m.\n"
-            f"Это тестовый аналитический сигнал, "
-            f"не гарантия результата.\n"
-            f"Сделки автоматически не открываются."
-        )
-
-    except Exception as exc:
-        logger.exception("Ошибка анализа %s", symbol)
-        await update.message.reply_text(
-            f"Не удалось выполнить анализ.\n{str(exc)[:200]}"
-        )
 
 
 async def health(request):
     return web.Response(text="SEIRANBOT is running")
 
 
-async def main():
-    if not TOKEN:
-        raise RuntimeError("Не задан BOT_TOKEN в Render")
+async def post_init(application):
+    global session, ws_task, health_runner
 
-    bot_app = Application.builder().token(TOKEN).build()
+    session = aiohttp.ClientSession()
+    ws_task = asyncio.create_task(websocket_worker())
 
-    bot_app.add_handler(CommandHandler("start", start))
-    bot_app.add_handler(CommandHandler("help", help_command))
-    bot_app.add_handler(CommandHandler("price", price_command))
-    bot_app.add_handler(CommandHandler("candles", candles_command))
-    bot_app.add_handler(CommandHandler("analysis", analysis_command))
+    health_app = web.Application()
+    health_app.router.add_get("/", health)
 
-    await bot_app.initialize()
-    await bot_app.start()
-    await bot_app.updater.start_polling()
+    health_runner = web.AppRunner(health_app)
+    await health_runner.setup()
 
-    web_app = web.Application()
-    web_app.router.add_get("/", health)
-    web_app.router.add_get("/health", health)
-
-    runner = web.AppRunner(web_app)
-    await runner.setup()
-
-    site = web.TCPSite(runner, "0.0.0.0", PORT)
+    site = web.TCPSite(health_runner, "0.0.0.0", PORT)
     await site.start()
 
-    logger.info("SEIRANBOT запущен на порту %s", PORT)
+    logging.info("SEIRANBOT запущен")
 
-    await asyncio.Event().wait()
+
+async def post_shutdown(application):
+    global session, ws_task, health_runner
+
+    if ws_task:
+        ws_task.cancel()
+        try:
+            await ws_task
+        except asyncio.CancelledError:
+            pass
+
+    if session:
+        await session.close()
+
+    if health_runner:
+        await health_runner.cleanup()
+
+
+def main():
+    if not TOKEN:
+        raise RuntimeError("Не задан BOT_TOKEN в Render Environment")
+
+    application = (
+        Application.builder()
+        .token(TOKEN)
+        .post_init(post_init)
+        .post_shutdown(post_shutdown)
+        .build()
+    )
+
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("help", help_command))
+    application.add_handler(CommandHandler("price", price_command))
+    application.add_handler(CommandHandler("candles", candles_command))
+    application.add_handler(CommandHandler("analysis", analysis_command))
+
+    application.run_polling()
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
-    
+    main()
