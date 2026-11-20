@@ -1,18 +1,4 @@
 
-            )
-
-    return result
-
-
-def rsi(values, period=14):
-    if len(values) < period + 1:
-        return None
-
-    changes = [
-        values[i] - values[i - 1]
-        for i in range(1, len(values))
-    ]
-
     gains = [max(x, 0) for x in changes[-period:]]
     losses = [max(-x, 0) for x in changes[-period:]]
 
