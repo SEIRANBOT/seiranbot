@@ -1,127 +1,106 @@
 
 import os
 import logging
-import time
-
 import aiohttp
+
 from telegram import Update
 from telegram.ext import (
-    ApplicationBuilder,
+    Application,
     CommandHandler,
     ContextTypes,
 )
 
-logging.basicConfig(level=logging.INFO)
-log = logging.getLogger(__name__)
+logging.basicConfig(
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    level=logging.INFO,
+)
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-OTCHARTS_API_KEY = os.getenv("OTCHARTS_API_KEY")
-BASE_URL = "https://otcharts.com"
+BINANCE_URL = "https://api.binance.com"
+
+DEFAULT_SYMBOL = "BTCUSDT"
+DEFAULT_INTERVAL = "5m"
+
+SYMBOLS = [
+    "BTCUSDT",
+    "ETHUSDT",
+    "BNBUSDT",
+    "SOLUSDT",
+    "XRPUSDT",
+    "DOGEUSDT",
+    "ADAUSDT",
+    "LTCUSDT",
+    "TRXUSDT",
+    "LINKUSDT",
+]
+
+INTERVALS = ["1m", "5m", "15m"]
 
 
-async def api_get(path, params=None):
-    if not OTCHARTS_API_KEY:
-        raise RuntimeError("Нет OTCHARTS_API_KEY в Render.")
+async def binance_get(path, params=None):
+    timeout = aiohttp.ClientTimeout(total=15)
 
-    headers = {
-        "Authorization": f"Bearer {OTCHARTS_API_KEY}",
-        "User-Agent": "SEIRANBOT/1.0",
-    }
-
-    timeout = aiohttp.ClientTimeout(total=20)
     async with aiohttp.ClientSession(timeout=timeout) as session:
         async with session.get(
-            BASE_URL + path,
-            headers=headers,
-            params=params,
+            BINANCE_URL + path,
+            params=params
         ) as response:
-            data = await response.json(content_type=None)
             if response.status != 200:
                 raise RuntimeError(
-                    f"OTCharts HTTP {response.status}: {data}"
+                    f"Binance ответил с ошибкой: {response.status}"
                 )
-            return data
+            return await response.json()
 
 
-async def get_venue():
-    data = await api_get("/v1/venues")
-    venues = data.get("venues", [])
-    available = [v for v in venues if v.get("open") is True]
-
-    if not available:
-        raise RuntimeError("Нет доступной площадки OTCharts.")
-
-    if len(available) == 1:
-        return available[0]["id"]
-
-    otc = [v for v in available if v.get("id") == "otc"]
-    if otc:
-        return "otc"
-
-    names = ", ".join(v.get("id", "?") for v in available)
-    raise RuntimeError(
-        f"Доступно несколько площадок: {names}. "
-        "Нужно выбрать одну."
+async def get_price(symbol):
+    data = await binance_get(
+        "/api/v3/ticker/price",
+        {"symbol": symbol}
     )
+    return float(data["price"])
 
 
-async def get_symbols(venue):
-    data = await api_get("/v1/symbols", {"venue": venue})
-    return data.get("symbols", [])
-
-
-async def find_symbol(venue, requested):
-    symbols = await get_symbols(venue)
-    requested = requested.upper()
-
-    for item in symbols:
-        name = item.get("symbol", "")
-        if name.upper() == requested and item.get("open") is not False:
-            return name
-
-    raise RuntimeError(
-        f"Пара {requested} не найдена или закрыта. "
-        "Используй /symbols."
-    )
-
-
-async def get_candles(venue, symbol, limit=100):
-    data = await api_get(
-        "/v1/candles",
+async def get_candles(symbol, interval):
+    data = await binance_get(
+        "/api/v3/klines",
         {
-            "venue": venue,
             "symbol": symbol,
-            "tf": 60,
-            "limit": limit,
-        },
+            "interval": interval,
+            "limit": 100,
+        }
     )
-    return data.get("candles", []), data.get("gaps", {})
+
+    # Последняя свеча может быть ещё не закрыта.
+    candles = data[:-1]
+
+    return [
+        float(candle[4])
+        for candle in candles
+    ]
 
 
-def ema(values, period):
-    if len(values) < period:
-        return None
-
-    result = sum(values[:period]) / period
+def calculate_ema(values, period):
     multiplier = 2 / (period + 1)
+    ema = values[0]
 
-    for value in values[period:]:
-        result = (value - result) * multiplier + result
+    for value in values[1:]:
+        ema = (value * multiplier) + (
+            ema * (1 - multiplier)
+        )
 
-    return result
+    return ema
 
 
-def rsi(values, period=14):
-    if len(values) <= period:
-        return None
-
+def calculate_rsi(values, period=14):
     changes = [
         values[i] - values[i - 1]
         for i in range(1, len(values))
     ]
 
-    gains = [max(x, 0) for x in changes[-period:]]
-    losses = [max(-x, 0) for x in changes[-period:]]
+    recent = changes[-period:]
+
+    gains = [max(x, 0) for x in recent]
+    losses = [max(-x, 0) for x in recent]
 
     avg_gain = sum(gains) / period
     avg_loss = sum(losses) / period
@@ -133,171 +112,149 @@ def rsi(values, period=14):
     return 100 - (100 / (1 + rs))
 
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "SEIRANBOT работает!\n\n"
-        "/symbols — список пар\n"
-        "/price EURUSD_otc — последняя цена свечи\n"
-        "/candles EURUSD_otc — последние свечи\n"
-        "/analysis EURUSD_otc — анализ\n"
-        "/usage — лимит API"
+async def make_analysis(symbol, interval):
+    prices = await get_candles(symbol, interval)
+
+    if len(prices) < 50:
+        raise RuntimeError("Недостаточно свечей для анализа")
+
+    ema20 = calculate_ema(prices[-50:], 20)
+    ema50 = calculate_ema(prices[-50:], 50)
+    rsi = calculate_rsi(prices, 14)
+    price = prices[-1]
+
+    if ema20 > ema50 and 50 <= rsi < 70:
+        signal = "BUY 🟢"
+    elif ema20 < ema50 and 30 < rsi <= 50:
+        signal = "SELL 🔴"
+    else:
+        signal = "WAIT 🟡"
+
+    return (
+        f"SEIRANBOT — АНАЛИЗ\n\n"
+        f"Инструмент: {symbol}\n"
+        f"Таймфрейм: {interval}\n"
+        f"Цена: {price:.8g}\n\n"
+        f"EMA 20: {ema20:.8g}\n"
+        f"EMA 50: {ema50:.8g}\n"
+        f"RSI 14: {rsi:.2f}\n\n"
+        f"Сигнал: {signal}\n\n"
+        f"Источник: Binance Spot\n"
+        f"Это технический сигнал, не гарантия прибыли."
     )
 
 
-async def symbols_cmd(update, context):
-    try:
-        venue = await get_venue()
-        symbols = await get_symbols(venue)
-        names = [
-            s["symbol"] for s in symbols
-            if s.get("open") is not False and s.get("symbol")
-        ]
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "Привет! Я SEIRANBOT 🤖\n\n"
+        "Получаю бесплатные криптокотировки Binance.\n\n"
+        "Команды:\n"
+        "/symbols — список инструментов\n"
+        "/price BTCUSDT — текущая цена\n"
+        "/signal BTCUSDT 5m — сигнал\n"
+        "/analysis ETHUSDT 15m — анализ\n"
+        "/help — помощь\n\n"
+        "Таймфреймы: 1m, 5m, 15m"
+    )
 
-        if not names:
-            await update.message.reply_text("Открытых пар нет.")
-            return
 
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await start(update, context)
+
+
+async def symbols_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "Доступные инструменты:\n\n"
+        + "\n".join(SYMBOLS)
+        + "\n\nПример: /signal BTCUSDT 5m"
+    )
+
+
+async def price_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    symbol = DEFAULT_SYMBOL
+
+    if context.args:
+        symbol = context.args[0].upper()
+
+    if not symbol.endswith("USDT"):
         await update.message.reply_text(
-            f"Площадка: {venue}\n" + "\n".join(names[:50])
+            "Укажи пару в формате BTCUSDT."
         )
-    except Exception as exc:
-        await update.message.reply_text(str(exc))
-
-
-async def price_cmd(update, context):
-    if not context.args:
-        await update.message.reply_text("Пример: /price EURUSD_otc")
         return
 
     try:
-        venue = await get_venue()
-        symbol = await find_symbol(venue, context.args[0])
-        candles, _ = await get_candles(venue, symbol, 2)
-
-        if not candles:
-            raise RuntimeError("Нет свечей.")
-
-        candle = candles[-1]
+        price = await get_price(symbol)
         await update.message.reply_text(
-            f"{symbol}\n"
-            f"Закрытие последней свечи: {candle.get('close')}\n"
-            f"Время: {candle.get('time', '-')}"
+            f"{symbol}\nЦена: {price:.8g} USDT"
         )
-    except Exception as exc:
-        await update.message.reply_text(str(exc))
+    except Exception as error:
+        logging.exception("Price error")
+        await update.message.reply_text(
+            f"Не удалось получить цену: {error}"
+        )
 
 
-async def candles_cmd(update, context):
-    if not context.args:
-        await update.message.reply_text("Пример: /candles EURUSD_otc")
+async def signal_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    symbol = DEFAULT_SYMBOL
+    interval = DEFAULT_INTERVAL
+
+    if len(context.args) >= 1:
+        symbol = context.args[0].upper()
+
+    if len(context.args) >= 2:
+        interval = context.args[1].lower()
+
+    if not symbol.endswith("USDT"):
+        await update.message.reply_text(
+            "Нужен формат пары, например BTCUSDT."
+        )
         return
 
-    try:
-        venue = await get_venue()
-        symbol = await find_symbol(venue, context.args[0])
-        candles, _ = await get_candles(venue, symbol, 6)
-
-        if not candles:
-            raise RuntimeError("Нет свечей.")
-
-        lines = [
-            f"Закрытие: {c.get('close')} | Время: {c.get('time', '-')}"
-            for c in candles[-5:]
-        ]
+    if interval not in INTERVALS:
         await update.message.reply_text(
-            f"{symbol}\n" + "\n".join(lines)
+            "Выбери таймфрейм: 1m, 5m или 15m."
         )
-    except Exception as exc:
-        await update.message.reply_text(str(exc))
-
-
-async def analysis_cmd(update, context):
-    if not context.args:
-        await update.message.reply_text("Пример: /analysis EURUSD_otc")
         return
 
+    await update.message.reply_text(
+        "Анализирую рынок..."
+    )
+
     try:
-        venue = await get_venue()
-        symbol = await find_symbol(venue, context.args[0])
-        candles, gaps = await get_candles(venue, symbol, 100)
-
-        if len(candles) < 55:
-            raise RuntimeError("Недостаточно свечей для анализа.")
-
-        if gaps.get("runs", 0):
-            raise RuntimeError("Есть разрывы в данных. Анализ остановлен.")
-
-        # Берём только завершившиеся минутные свечи.
-        now = int(time.time())
-        closed = [
-            c for c in candles
-            if int(c["time"]) + 60 <= now
-        ]
-
-        if len(closed) < 55:
-            raise RuntimeError("Недостаточно закрытых свечей.")
-
-        closes = [float(c["close"]) for c in closed]
-        fast = ema(closes, 20)
-        slow = ema(closes, 50)
-        strength = rsi(closes)
-
-        if fast is None or slow is None or strength is None:
-            raise RuntimeError("Не удалось рассчитать индикаторы.")
-
-        if fast > slow and strength > 55:
-            signal = "BUY — направление вверх"
-        elif fast < slow and strength < 45:
-            signal = "SELL — направление вниз"
-        else:
-            signal = "WAIT — нет чёткого сигнала"
-
+        result = await make_analysis(symbol, interval)
+        await update.message.reply_text(result)
+    except Exception as error:
+        logging.exception("Signal error")
         await update.message.reply_text(
-            f"Анализ {symbol}\n\n"
-            f"EMA 20: {fast:.6f}\n"
-            f"EMA 50: {slow:.6f}\n"
-            f"RSI 14: {strength:.2f}\n\n"
-            f"{signal}\n\n"
-            "Учебный сигнал, не гарантия результата."
+            f"Ошибка анализа: {error}"
         )
-    except Exception as exc:
-        await update.message.reply_text(str(exc))
 
 
-async def usage_cmd(update, context):
-    try:
-        data = await api_get("/v1/usage")
-        await update.message.reply_text(
-            "Информация о лимите OTCharts:\n"
-            + str(data)[:3500]
-        )
-    except Exception as exc:
-        await update.message.reply_text(str(exc))
-
-
-async def error_handler(update, context):
-    log.error("Ошибка Telegram: %s", context.error)
+async def analysis_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await signal_command(update, context)
 
 
 def main():
     if not BOT_TOKEN:
-        raise RuntimeError("Нет BOT_TOKEN в Render.")
-    if not OTCHARTS_API_KEY:
-        raise RuntimeError("Нет OTCHARTS_API_KEY в Render.")
+        raise RuntimeError(
+            "Не задан BOT_TOKEN в переменных окружения."
+        )
 
-    app = ApplicationBuilder().token(BOT_TOKEN).build()
+    application = (
+        Application.builder()
+        .token(BOT_TOKEN)
+        .build()
+    )
 
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("help", start))
-    app.add_handler(CommandHandler("symbols", symbols_cmd))
-    app.add_handler(CommandHandler("price", price_cmd))
-    app.add_handler(CommandHandler("candles", candles_cmd))
-    app.add_handler(CommandHandler("analysis", analysis_cmd))
-    app.add_handler(CommandHandler("usage", usage_cmd))
-    app.add_error_handler(error_handler)
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("help", help_command))
+    application.add_handler(CommandHandler("symbols", symbols_command))
+    application.add_handler(CommandHandler("price", price_command))
+    application.add_handler(CommandHandler("signal", signal_command))
+    application.add_handler(CommandHandler("analysis", analysis_command))
 
-    log.info("SEIRANBOT started")
-    app.run_polling()
+    logging.info("SEIRANBOT запущен")
+    application.run_polling()
 
 
 if __name__ == "__main__":
