@@ -32,8 +32,7 @@ SYMBOLS = [
 ]
 
 BASE_URL = "https://data-api.binance.vision"
-STREAM_URL = "wss://stream.binance.com:9443/stream"
-
+STREAM_URL = "wss://data-stream.binance.vision/stream"
 session = None
 ws_task = None
 health_runner = None
