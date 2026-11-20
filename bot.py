@@ -26,7 +26,5 @@ def analyze_candles(candles):
         return None
 "]
     }
-
-
 # ==============================
 # TELEGRAM COMMANDS: /price BTCUSDT")
