@@ -1,259 +1,291 @@
 import os
+import json
 import asyncio
 import logging
-import time
-from aiohttp import ClientSession, ClientTimeout, WSMsgType, web
+from datetime import datetime, timezone
+
+import aiohttp
 from telegram import Update
-from telegram.ext import Application, CommandHandler, ContextTypes
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    ContextTypes,
+)
 
-logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
-log = logging.getLogger('seiranbot')
+# ==============================
+# SEIRANBOT — BYBIT EDITION
+# ==============================
 
-TOKEN = os.getenv('BOT_TOKEN')
-BASE_URL = 'https://data-api.binance.vision'
-STREAM_URL = 'wss://data-stream.binance.vision/stream'
-SYMBOLS = [
-    'BTCUSDT','ETHUSDT','BNBUSDT','SOLUSDT','XRPUSDT','ADAUSDT','DOGEUSDT','TRXUSDT',
-    'LINKUSDT','AVAXUSDT','LTCUSDT','DOTUSDT','BCHUSDT','ETCUSDT','NEARUSDT','ATOMUSDT',
-    'UNIUSDT','APTUSDT','FILUSDT','SUIUSDT'
-]
-TIMEFRAMES = ['1m','3m','5m','15m','30m','1h','2h','4h','6h','8h','12h','1d','3d','1w','1M']
+TOKEN = os.getenv("TELEGRAM_TOKEN")
+BYBIT_URL = "https://api.bybit.com"
+WS_URL = "wss://stream.bybit.com/v5/public/spot"
 
-http: ClientSession | None = None
-ws_task: asyncio.Task | None = None
-web_runner: web.AppRunner | None = None
-price_cache: dict[str, float] = {}
-candle_cache: dict[tuple[str, str], tuple[float, list]] = {}
-known_symbols: set[str] = set(SYMBOLS)
-symbols_loaded_at = 0.0
-rest_blocked_until = 0.0
+TIMEFRAME = "5"
+SCAN_INTERVAL = 300
+MAX_PAIRS = 20
+
+logging.basicConfig(
+    format="%(asctime)s %(levelname)s %(message)s",
+    level=logging.INFO
+)
+log = logging.getLogger("SEIRANBOT")
+
+session = None
+price_cache = {}
+chat_ids = set()
+last_signals = {}
+ws_task = None
+scan_task = None
+web_runner = None
 
 
-async def api_get(path: str, params: dict | None = None):
-    global rest_blocked_until
-    if time.monotonic() < rest_blocked_until:
-        raise RuntimeError('Binance REST временно ограничил запросы. Подождите несколько минут.')
-    if http is None:
-        raise RuntimeError('HTTP-сессия ещё не запущена.')
-    async with http.get(BASE_URL + path, params=params) as response:
-        if response.status in (418, 429):
-            rest_blocked_until = time.monotonic() + 300
-            raise RuntimeError('Binance ограничил частоту запросов. Подождите 5 минут.')
+# ==============================
+# BYBIT API
+# ==============================
+
+async def api_get(path, params=None):
+    url = BYBIT_URL + path
+
+    async with session.get(
+        url,
+        params=params,
+        timeout=aiohttp.ClientTimeout(total=15)
+    ) as response:
         response.raise_for_status()
-        return await response.json()
+        data = await response.json()
+
+    if data.get("retCode") != 0:
+        raise RuntimeError(data.get("retMsg", "Bybit API error"))
+
+    return data.get("result", {})
 
 
-async def refresh_symbols():
-    global known_symbols, symbols_loaded_at
-    data = await api_get('/api/v3/exchangeInfo')
-    known_symbols = {
-        item['symbol'] for item in data.get('symbols', [])
-        if item.get('quoteAsset') == 'USDT'
-        and item.get('status') == 'TRADING'
-        and item.get('isSpotTradingAllowed', True)
-    }
-    symbols_loaded_at = time.monotonic()
-
-
-async def check_symbol(raw: str):
-    symbol = raw.upper().replace('/', '').strip()
-    if not symbol.endswith('USDT'):
-        return None
-    if time.monotonic() - symbols_loaded_at > 3600:
-        try:
-            await refresh_symbols()
-        except Exception as exc:
-            log.warning('Не обновлён список пар: %s', exc)
-    return symbol if symbol in known_symbols else None
-
-
-async def websocket_worker():
-    while True:
-        try:
-            streams = '/'.join(f'{s.lower()}@kline_1m' for s in SYMBOLS)
-            async with http.ws_connect(f'{STREAM_URL}?streams={streams}', heartbeat=30) as ws:
-                log.info('Binance WebSocket подключён')
-                async for msg in ws:
-                    if msg.type == WSMsgType.TEXT:
-                        payload = msg.json().get('data', {})
-                        kline = payload.get('k')
-                        if kline:
-                            price_cache[kline['s']] = float(kline['c'])
-                    elif msg.type in (WSMsgType.ERROR, WSMsgType.CLOSED):
-                        break
-        except asyncio.CancelledError:
-            break
-        except Exception as exc:
-            log.warning('WebSocket ошибка: %s', exc)
-        await asyncio.sleep(10)
-
-
-async def get_price(symbol: str) -> float:
+async def get_price(symbol):
     if symbol in price_cache:
         return price_cache[symbol]
-    data = await api_get('/api/v3/ticker/price', {'symbol': symbol})
-    return float(data['price'])
+
+    result = await api_get(
+        "/v5/market/tickers",
+        {"category": "spot", "symbol": symbol}
+    )
+
+    items = result.get("list", [])
+    if not items:
+        return None
+
+    price = float(items[0]["lastPrice"])
+    price_cache[symbol] = price
+    return price
 
 
-async def get_candles(symbol: str, interval: str = '1m', limit: int = 200):
-    if interval not in TIMEFRAMES:
-        raise ValueError('Неверный таймфрейм. Используйте /timeframes.')
-    key = (symbol, interval)
-    now = time.monotonic()
-    cached = candle_cache.get(key)
-    if cached and now - cached[0] < 20:
-        return cached[1]
-    rows = await api_get('/api/v3/klines', {'symbol': symbol, 'interval': interval, 'limit': limit})
-    candles = [{'open': float(x[1]), 'high': float(x[2]), 'low': float(x[3]),
-                'close': float(x[4]), 'volume': float(x[5])} for x in rows]
-    candle_cache[key] = (now, candles)
-    return candles
+async def get_pairs():
+    result = await api_get(
+        "/v5/market/tickers",
+        {"category": "spot"}
+    )
+
+    pairs = []
+
+    for item in result.get("list", []):
+        symbol = item.get("symbol", "")
+
+        if not symbol.endswith("USDT"):
+            continue
+
+        try:
+            turnover = float(item.get("turnover24h", 0))
+            price = float(item.get("lastPrice", 0))
+
+            if turnover > 0 and price > 0:
+                pairs.append((symbol, turnover))
+        except (ValueError, TypeError):
+            continue
+
+    pairs.sort(key=lambda x: x[1], reverse=True)
+    return pairs
 
 
-def sma(values, period):
-    return sum(values[-period:]) / period if len(values) >= period else None
+async def get_candles(symbol, interval=TIMEFRAME, limit=100):
+    result = await api_get(
+        "/v5/market/kline",
+        {
+            "category": "spot",
+            "symbol": symbol,
+            "interval": interval,
+            "limit": limit
+        }
+    )
 
+    rows = result.get("list", [])
+    rows.reverse()
+
+    return [
+        {
+            "time": int(row[0]),
+            "open": float(row[1]),
+            "high": float(row[2]),
+            "low": float(row[3]),
+            "close": float(row[4]),
+            "volume": float(row[5])
+        }
+        for row in rows
+    ]
+
+
+# ==============================
+# WEBSOCKET PRICE STREAM
+# ==============================
+
+async def websocket_worker():
+    symbols = [
+        "BTCUSDT", "ETHUSDT", "BNBUSDT", "SOLUSDT",
+        "XRPUSDT", "ADAUSDT", "DOGEUSDT", "TRXUSDT",
+        "LINKUSDT", "AVAXUSDT", "LTCUSDT", "DOTUSDT",
+        "BCHUSDT", "ETCUSDT", "NEARUSDT", "ATOMUSDT",
+        "UNIUSDT", "APTUSDT", "FILUSDT", "SUIUSDT"
+    ]
+
+    topics = [f"tickers.{symbol}" for symbol in symbols]
+
+    while True:
+        try:
+            async with session.ws_connect(
+                WS_URL,
+                heartbeat=20
+            ) as ws:
+
+                await ws.send_json({
+                    "op": "subscribe",
+                    "args": topics
+                })
+
+                log.info("Bybit WebSocket connected")
+
+                async for message in ws:
+                    if message.type == aiohttp.WSMsgType.TEXT:
+                        data = json.loads(message.data)
+                        topic = data.get("topic", "")
+
+                        if topic.startswith("tickers."):
+                            symbol = topic.split(".")[-1]
+                            ticker = data.get("data", {})
+                            price = ticker.get("lastPrice")
+
+                            if price:
+                                price_cache[symbol] = float(price)
+
+                    elif message.type in (
+                        aiohttp.WSMsgType.ERROR,
+                        aiohttp.WSMsgType.CLOSED
+                    ):
+                        break
+
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:
+            log.warning("WebSocket reconnect: %s", error)
+
+        await asyncio.sleep(5)
+
+
+# ==============================
+# TECHNICAL INDICATORS
+# ==============================
 
 def ema(values, period):
     if len(values) < period:
         return None
-    value = sum(values[:period]) / period
-    alpha = 2 / (period + 1)
-    for item in values[period:]:
-        value = alpha * item + (1 - alpha) * value
-    return value
+
+    result = sum(values[:period]) / period
+    multiplier = 2 / (period + 1)
+
+    for value in values[period:]:
+        result = (
+            value * multiplier
+            + result * (1 - multiplier)
+        )
+
+    return result
 
 
 def rsi(values, period=14):
     if len(values) < period + 1:
         return None
-    changes = [values[i] - values[i - 1] for i in range(1, len(values))]
+
+    changes = [
+        values[i] - values[i - 1]
+        for i in range(1, len(values))
+    ]
+
     gains = [max(x, 0) for x in changes[-period:]]
     losses = [max(-x, 0) for x in changes[-period:]]
-    avg_gain, avg_loss = sum(gains) / period, sum(losses) / period
+
+    avg_gain = sum(gains) / period
+    avg_loss = sum(losses) / period
+
     if avg_loss == 0:
         return 100.0
-    return 100 - 100 / (1 + avg_gain / avg_loss)
+
+    rs = avg_gain / avg_loss
+    return 100 - (100 / (1 + rs))
 
 
-def macd(values):
-    fast, slow = ema(values, 12), ema(values, 26)
-    return fast - slow if fast is not None and slow is not None else None
-
-
-def bollinger(values, period=20):
-    middle = sma(values, period)
-    if middle is None:
+def analyze_candles(candles):
+    if len(candles) < 30:
         return None
-    variance = sum((x - middle) ** 2 for x in values[-period:]) / period
-    deviation = variance ** 0.5
-    return middle + 2 * deviation, middle, middle - 2 * deviation
 
+    closes = [c["close"] for c in candles]
 
-def stochastic(candles, period=14):
-    if len(candles) < period:
+    fast = ema(closes, 9)
+    slow = ema(closes, 21)
+    strength = rsi(closes)
+
+    if fast is None or slow is None or strength is None:
         return None
-    recent = candles[-period:]
-    high = max(x['high'] for x in recent)
-    low = min(x['low'] for x in recent)
-    return 50.0 if high == low else 100 * (candles[-1]['close'] - low) / (high - low)
 
+    price = closes[-1]
+    previous = closes[-2]
 
-def cci(candles, period=20):
-    if len(candles) < period:
-        return None
-    typical = [(x['high'] + x['low'] + x['close']) / 3 for x in candles[-period:]]
-    mean = sum(typical) / period
-    deviation = sum(abs(x - mean) for x in typical) / period
-    return 0.0 if deviation == 0 else (typical[-1] - mean) / (0.015 * deviation)
+    signal = "WAIT"
+    reason = "Нет подтверждённого сигнала"
 
+    if fast > slow and price > fast and 50 < strength < 68:
+        signal = "BUY"
+        reason = "EMA 9 выше EMA 21, цена выше EMA 9, RSI подтверждает движение"
 
-def atr(candles, period=14):
-    if len(candles) < period + 1:
-        return None
-    ranges = []
-    for i in range(1, len(candles)):
-        cur, prev = candles[i], candles[i - 1]['close']
-        ranges.append(max(cur['high'] - cur['low'], abs(cur['high'] - prev), abs(cur['low'] - prev)))
-    return sum(ranges[-period:]) / period
+    elif fast < slow and price < fast and 32 < strength < 50:
+        signal = "SELL"
+        reason = "EMA 9 ниже EMA 21, цена ниже EMA 9, RSI подтверждает движение"
 
-
-def adx(candles, period=14):
-    if len(candles) < period + 1:
-        return None
-    plus, minus, trs = [], [], []
-    for i in range(1, len(candles)):
-        cur, prev = candles[i], candles[i - 1]
-        up, down = cur['high'] - prev['high'], prev['low'] - cur['low']
-        plus.append(up if up > down and up > 0 else 0.0)
-        minus.append(down if down > up and down > 0 else 0.0)
-        trs.append(max(cur['high'] - cur['low'], abs(cur['high'] - prev['close']), abs(cur['low'] - prev['close'])))
-    tr = sum(trs[-period:])
-    if tr == 0:
-        return 0.0
-    pdi, mdi = 100 * sum(plus[-period:]) / tr, 100 * sum(minus[-period:]) / tr
-    return 0.0 if pdi + mdi == 0 else 100 * abs(pdi - mdi) / (pdi + mdi)
-
-
-def candle_pattern(candles):
-    if len(candles) < 2:
-        return 'Недостаточно данных'
-    cur, prev = candles[-1], candles[-2]
-    body, span = abs(cur['close'] - cur['open']), cur['high'] - cur['low']
-    if span == 0 or body / span < 0.1:
-        return 'Доджи'
-    if cur['close'] > cur['open'] and prev['close'] < prev['open'] and cur['close'] > prev['open'] and cur['open'] < prev['close']:
-        return 'Бычье поглощение'
-    if cur['close'] < cur['open'] and prev['close'] > prev['open'] and cur['close'] < prev['open'] and cur['open'] > prev['close']:
-        return 'Медвежье поглощение'
-    return 'Бычья свеча' if cur['close'] > cur['open'] else 'Медвежья свеча'
-
-
-def analyze(candles):
-    closes = [x['close'] for x in candles]
-    volumes = [x['volume'] for x in candles]
-    e20, e50, rv, mv = ema(closes, 20), ema(closes, 50), rsi(closes), macd(closes)
-    bb, st, cv = bollinger(closes), stochastic(candles), cci(candles)
-    av, dx = atr(candles), adx(candles)
-    score = 0
-    if e20 is not None and e50 is not None:
-        score += 1 if e20 > e50 else -1 if e20 < e50 else 0
-    if rv is not None:
-        score += 1 if rv > 55 else -1 if rv < 45 else 0
-    if mv is not None:
-        score += 1 if mv > 0 else -1 if mv < 0 else 0
-    if st is not None:
-        score += 1 if st < 20 else -1 if st > 80 else 0
-    if cv is not None:
-        score += 1 if cv > 100 else -1 if cv < -100 else 0
-    signal = 'BUY 🟢' if score >= 3 else 'SELL 🔴' if score <= -3 else 'WAIT 🟡'
-    recent = candles[-50:]
-    fib_high, fib_low = max(x['high'] for x in recent), min(x['low'] for x in recent)
-    distance = fib_high - fib_low
-    fib = [fib_high - distance * level for level in (0.236, 0.382, 0.5, 0.618, 0.786)]
     return {
-        'signal': signal, 'score': score, 'ema20': e20, 'ema50': e50, 'rsi': rv,
-        'macd': mv, 'bollinger': bb, 'stochastic': st, 'cci': cv, 'atr': av,
-        'adx': dx, 'pattern': candle_pattern(candles), 'support': fib_low,
-        'resistance': fib_high, 'volume_avg': sma(volumes, 20), 'fib': fib
+        "signal": signal,
+        "price": price,
+        "ema9": fast,
+        "ema21": slow,
+        "rsi": strength,
+        "reason": reason,
+        "candle_time": candles[-1]["time"]
     }
 
 
-def fmt(value, digits=6):
-    return 'нет данных' if value is None else f'{value:.{digits}f}'
-
+# ==============================
+# TELEGRAM COMMANDS
+# ==============================
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_ids.add(update.effective_chat.id)
+
     await update.message.reply_text(
-        'SEIRANBOT запущен.\n\n'
-        'Команды:\n'
-        '/price BTCUSDT — цена\n'
-        '/pairs — основные пары\n'
-        '/timeframes — таймфреймы\n'
-        '/candles BTCUSDT 5m — последние свечи\n'
-        '/analysis BTCUSDT 5m — технический анализ\n'
-        '/help — помощь\n\n'
-        'Бот анализирует рынок и не открывает сделки.'
+        "SEIRANBOT — BYBIT запущен!\n\n"
+        "Доступные команды:\n"
+        "/price BTCUSDT — цена\n"
+        "/pairs — активные пары\n"
+        "/candles BTCUSDT 5 — свечи\n"
+        "/analysis BTCUSDT 5 — анализ\n"
+        "/scan — автоматическое сканирование\n"
+        "/help — помощь\n\n"
+        "Бот анализирует рынок и отправляет сигналы. "
+        "Сделки самостоятельно не открывает."
     )
 
 
@@ -263,131 +295,273 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def price_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
-        await update.message.reply_text('Пример: /price BTCUSDT')
+        await update.message.reply_text("Пример: /price BTCUSDT")
         return
-    symbol = await check_symbol(context.args[0])
-    if not symbol:
-        await update.message.reply_text('Пара не найдена. Пример: /price BTCUSDT')
-        return
+
+    symbol = context.args[0].upper()
+
     try:
         price = await get_price(symbol)
-        await update.message.reply_text(f'{symbol}\nЦена Binance: {price:.8f}')
-    except Exception as exc:
-        await update.message.reply_text(f'Не удалось получить цену: {exc}')
+
+        if price is None:
+            await update.message.reply_text("Пара не найдена на Bybit Spot.")
+            return
+
+        await update.message.reply_text(
+            f"{symbol}\nЦена Bybit: {price}"
+        )
+
+    except Exception as error:
+        await update.message.reply_text(f"Ошибка Bybit: {error}")
 
 
 async def pairs_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text('Основные пары:\n' + ', '.join(SYMBOLS) + '\n\nМожно запросить любую доступную спотовую USDT-пару Binance, например /price XRPUSDT.')
+    try:
+        pairs = await get_pairs()
+        message = "АКТИВНЫЕ ПАРЫ BYBIT SPOT:\n\n"
 
+        for symbol, turnover in pairs[:20]:
+            message += f"{symbol} — оборот {turnover:,.0f} USDT\n"
 
-async def timeframes_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text('Доступные таймфреймы:\n' + ', '.join(TIMEFRAMES) + '\n\nПример: /analysis BTCUSDT 15m')
+        await update.message.reply_text(message)
+
+    except Exception as error:
+        await update.message.reply_text(f"Ошибка: {error}")
 
 
 async def candles_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
-        await update.message.reply_text('Пример: /candles BTCUSDT 1m')
+        await update.message.reply_text(
+            "Пример: /candles BTCUSDT 5"
+        )
         return
-    symbol = await check_symbol(context.args[0])
-    interval = context.args[1] if len(context.args) > 1 else '1m'
-    if not symbol:
-        await update.message.reply_text('Пара не найдена или не торгуется на Binance Spot.')
-        return
+
+    symbol = context.args[0].upper()
+    interval = context.args[1] if len(context.args) > 1 else "5"
+
     try:
         candles = await get_candles(symbol, interval, 5)
-        lines = [f'{symbol} — последние свечи {interval}:']
-        for c in candles:
-            color = '🟢' if c['close'] >= c['open'] else '🔴'
-            lines.append(f"{color} O {c['open']:.8f} | H {c['high']:.8f} | L {c['low']:.8f} | C {c['close']:.8f}")
-        await update.message.reply_text('\n'.join(lines))
-    except Exception as exc:
-        await update.message.reply_text(f'Не удалось получить свечи: {exc}')
+
+        message = f"ПОСЛЕДНИЕ 5 СВЕЧЕЙ — {symbol}\n\n"
+
+        for candle in candles:
+            color = "🟢" if candle["close"] >= candle["open"] else "🔴"
+
+            message += (
+                f"{color} O: {candle['open']} | "
+                f"H: {candle['high']} | "
+                f"L: {candle['low']} | "
+                f"C: {candle['close']}\n"
+            )
+
+        await update.message.reply_text(message)
+
+    except Exception as error:
+        await update.message.reply_text(f"Ошибка свечей: {error}")
 
 
 async def analysis_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
-        await update.message.reply_text('Пример: /analysis BTCUSDT 5m')
-        return
-    symbol = await check_symbol(context.args[0])
-    interval = context.args[1] if len(context.args) > 1 else '1m'
-    if not symbol:
-        await update.message.reply_text('Пара не найдена или не торгуется на Binance Spot.')
-        return
-    try:
-        candles = await get_candles(symbol, interval, 200)
-        if len(candles) < 55:
-            await update.message.reply_text('Недостаточно свечей для анализа.')
-            return
-        result = analyze(candles)
-        price = candles[-1]['close']
-        bb = result['bollinger']
-        text = (
-            f'АНАЛИЗ {symbol} | {interval}\n'
-            f'Цена: {price:.8f}\n'
-            f'Сигнал: {result["signal"]} (балл {result["score"]}/5)\n\n'
-            f'EMA20: {fmt(result["ema20"])}\nEMA50: {fmt(result["ema50"])}\n'
-            f'RSI14: {fmt(result["rsi"], 2)}\nMACD: {fmt(result["macd"])}\n'
-            f'Bollinger верх/середина/низ: {"нет данных" if bb is None else " / ".join(fmt(x) for x in bb)}\n'
-            f'Stochastic: {fmt(result["stochastic"], 2)}\nCCI: {fmt(result["cci"], 2)}\n'
-            f'ATR: {fmt(result["atr"])}\nADX-показатель: {fmt(result["adx"], 2)}\n'
-            f'Свечная форма: {result["pattern"]}\n'
-            f'Поддержка (50 свечей): {result["support"]:.8f}\n'
-            f'Сопротивление (50 свечей): {result["resistance"]:.8f}\n'
-            f'Средний объём 20 свечей: {fmt(result["volume_avg"], 2)}\n'
-            f'Фибо 23.6/38.2/50/61.8/78.6: ' + ' / '.join(fmt(x) for x in result['fib']) +
-            '\n\nЭто техническая оценка, не гарантия движения цены. Сделки бот не открывает.'
+        await update.message.reply_text(
+            "Пример: /analysis BTCUSDT 5"
         )
-        await update.message.reply_text(text)
-    except Exception as exc:
-        await update.message.reply_text(f'Ошибка анализа: {exc}')
+        return
 
+    symbol = context.args[0].upper()
+    interval = context.args[1] if len(context.args) > 1 else "5"
+
+    try:
+        candles = await get_candles(symbol, interval, 100)
+        result = analyze_candles(candles)
+
+        if not result:
+            await update.message.reply_text("Недостаточно данных для анализа.")
+            return
+
+        message = (
+            f"АНАЛИЗ {symbol}\n"
+            f"Источник: Bybit Spot\n"
+            f"Таймфрейм: {interval}m\n\n"
+            f"Цена: {result['price']}\n"
+            f"EMA 9: {result['ema9']:.6f}\n"
+            f"EMA 21: {result['ema21']:.6f}\n"
+            f"RSI: {result['rsi']:.2f}\n\n"
+            f"Сигнал: {result['signal']}\n"
+            f"Причина: {result['reason']}\n\n"
+            "Это аналитический сигнал, не гарантия результата."
+        )
+
+        await update.message.reply_text(message)
+
+    except Exception as error:
+        await update.message.reply_text(f"Ошибка анализа: {error}")
+
+
+# ==============================
+# AUTOMATIC MARKET SCANNER
+# ==============================
+
+async def scan_market(bot):
+    pairs = await get_pairs()
+    selected = pairs[:MAX_PAIRS]
+
+    semaphore = asyncio.Semaphore(5)
+
+    async def check_pair(item):
+        symbol = item[0]
+
+        async with semaphore:
+            try:
+                candles = await get_candles(symbol, "5", 100)
+                result = analyze_candles(candles)
+
+                if not result or result["signal"] == "WAIT":
+                    return None
+
+                key = (symbol, result["candle_time"])
+                if key in last_signals:
+                    return None
+
+                last_signals[key] = True
+
+                return (
+                    f"SEIRANBOT — СИГНАЛ\n\n"
+                    f"Пара: {symbol}\n"
+                    f"Источник: Bybit Spot\n"
+                    f"Таймфрейм: 5 минут\n"
+                    f"Направление: {result['signal']}\n"
+                    f"Цена: {result['price']}\n"
+                    f"RSI: {result['rsi']:.2f}\n"
+                    f"Причина: {result['reason']}\n\n"
+                    "Сигнал требует самостоятельной проверки. "
+                    "Прибыль не гарантируется."
+                )
+
+            except Exception as error:
+                log.warning("%s scan error: %s", symbol, error)
+                return None
+
+    results = await asyncio.gather(
+        *(check_pair(item) for item in selected)
+    )
+
+    for message in results:
+        if message:
+            for chat_id in list(chat_ids):
+                try:
+                    await bot.send_message(chat_id, message)
+                except Exception as error:
+                    log.warning("Telegram send error: %s", error)
+
+
+async def scanner_worker(application):
+    while True:
+        try:
+            await scan_market(application.bot)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log.exception("Scanner error")
+
+        await asyncio.sleep(SCAN_INTERVAL)
+
+
+async def scan_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_ids.add(update.effective_chat.id)
+
+    await update.message.reply_text(
+        "Начинаю сканирование активных пар Bybit. Подожди..."
+    )
+
+    try:
+        await scan_market(context.bot)
+        await update.message.reply_text(
+            "Сканирование завершено."
+        )
+    except Exception as error:
+        await update.message.reply_text(f"Ошибка сканирования: {error}")
+
+
+# ==============================
+# RENDER HEALTH CHECK
+# ==============================
 
 async def health(request):
-    return web.Response(text='SEIRANBOT is running')
+    return aiohttp.web.Response(text="SEIRANBOT OK")
 
 
-async def post_init(application: Application):
-    global http, ws_task, web_runner
-    http = ClientSession(timeout=ClientTimeout(total=25))
+async def post_init(application):
+    global session, ws_task, scan_task, web_runner
+
+    session = aiohttp.ClientSession()
+
     ws_task = asyncio.create_task(websocket_worker())
+    scan_task = asyncio.create_task(scanner_worker(application))
+
+    from aiohttp import web
+
     app = web.Application()
-    app.router.add_get('/', health)
-    app.router.add_get('/health', health)
+    app.router.add_get("/", health)
+    app.router.add_get("/health", health)
+
     web_runner = web.AppRunner(app)
     await web_runner.setup()
-    port = int(os.getenv('PORT', '10000'))
-    site = web.TCPSite(web_runner, '0.0.0.0', port)
+
+    port = int(os.getenv("PORT", "10000"))
+    site = web.TCPSite(web_runner, "0.0.0.0", port)
     await site.start()
-    log.info('Health server started on port %s', port)
+
+    log.info("SEIRANBOT started")
 
 
-async def post_shutdown(application: Application):
-    global http, ws_task, web_runner
-    if ws_task:
-        ws_task.cancel()
-        try:
-            await ws_task
-        except asyncio.CancelledError:
-            pass
+async def post_shutdown(application):
+    global session, ws_task, scan_task, web_runner
+
+    for task in (ws_task, scan_task):
+        if task:
+            task.cancel()
+
+    for task in (ws_task, scan_task):
+        if task:
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+
     if web_runner:
         await web_runner.cleanup()
-    if http:
-        await http.close()
 
+    if session:
+        await session.close()
+
+
+# ==============================
+# MAIN
+# ==============================
 
 def main():
     if not TOKEN:
-        raise RuntimeError('Не задана переменная окружения BOT_TOKEN в Render.')
-    application = Application.builder().token(TOKEN).post_init(post_init).post_shutdown(post_shutdown).build()
-    application.add_handler(CommandHandler('start', start))
-    application.add_handler(CommandHandler('help', help_command))
-    application.add_handler(CommandHandler('price', price_command))
-    application.add_handler(CommandHandler('pairs', pairs_command))
-    application.add_handler(CommandHandler('timeframes', timeframes_command))
-    application.add_handler(CommandHandler('candles', candles_command))
-    application.add_handler(CommandHandler('analysis', analysis_command))
-    application.run_polling(allowed_updates=Update.ALL_TYPES)
+        raise RuntimeError("TELEGRAM_TOKEN is missing in Render Environment")
+
+    application = (
+        Application.builder()
+        .token(TOKEN)
+        .post_init(post_init)
+        .post_shutdown(post_shutdown)
+        .build()
+    )
+
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("help", help_command))
+    application.add_handler(CommandHandler("price", price_command))
+    application.add_handler(CommandHandler("pairs", pairs_command))
+    application.add_handler(CommandHandler("candles", candles_command))
+    application.add_handler(CommandHandler("analysis", analysis_command))
+    application.add_handler(CommandHandler("scan", scan_command))
+
+    application.run_polling(drop_pending_updates=True)
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()
+    
