@@ -214,9 +214,9 @@ async def signal_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if len(context.args) >= 2:
         interval = context.args[1].lower()
 
-    if not symbol.endswith("USDT"):
+    if not valid_symbol(symbol):
         await update.message.reply_text(
-            "Нужен формат пары, например BTCUSDT."
+            "Неверная пара. Напиши /symbols для списка инструментов Coinbase."
         )
         return
 
