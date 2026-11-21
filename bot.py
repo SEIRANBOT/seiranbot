@@ -137,7 +137,7 @@ async def make_analysis(symbol, interval):
         f"EMA 50: {ema50:.8g}\n"
         f"RSI 14: {rsi:.2f}\n\n"
         f"Сигнал: {signal}\n\n"
-        f"Источник: Binance Spot\n"
+        f"Источник: Coinbase Exchange\n"
         f"Это технический сигнал, не гарантия прибыли."
     )
 
