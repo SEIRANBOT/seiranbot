@@ -16,7 +16,7 @@ logging.basicConfig(
 )
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-BINANCE_URL = "https://api.binance.com"
+BINANCE_URL = "https://data-api.binance.vision"
 
 DEFAULT_SYMBOL = "BTCUSDT"
 DEFAULT_INTERVAL = "5m"
