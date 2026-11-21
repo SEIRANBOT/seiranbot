@@ -145,12 +145,12 @@ async def make_analysis(symbol, interval):
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "Привет! Я SEIRANBOT 🤖\n\n"
-        "Получаю бесплатные криптокотировки Binance.\n\n"
+        "Получаю бесплатные криптокотировки Coinbase.\n\n"
         "Команды:\n"
         "/symbols — список инструментов\n"
-        "/price BTCUSDT — текущая цена\n"
-        "/signal BTCUSDT 5m — сигнал\n"
-        "/analysis ETHUSDT 15m — анализ\n"
+        "/price BTC-USD — текущая цена\n"
+        "/signal BTC-USD 5m — сигнал\n"
+        "/analysis ETH-USD 15m — анализ\n"
         "/help — помощь\n\n"
         "Таймфреймы: 1m, 5m, 15m"
     )
