@@ -1,374 +1,599 @@
 import os
+import json
+import math
+import asyncio
 import logging
-import aiohttp
+from datetime import datetime, timezone
 
-from telegram import Update
-from telegram.ext import Application, CommandHandler, ContextTypes
+import aiohttp
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    CallbackQueryHandler,
+    ContextTypes,
+)
+
+# SEIRANBOT FINAL — live market monitoring and multi-timeframe signals
+# Requirements: python-telegram-bot[job-queue]>=21,<23 ; aiohttp>=3.9
+# Render environment variable: BOT_TOKEN (keep the existing value)
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     level=logging.INFO,
 )
+log = logging.getLogger("SEIRANBOT")
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-COINBASE_URL = "https://api.exchange.coinbase.com"
-
-DEFAULT_SYMBOL = "BTCUSDT"
+BASE_URL = "https://api.exchange.coinbase.com"
+DEFAULT_SYMBOL = "BTC-USD"
 DEFAULT_INTERVAL = "5m"
-
-SYMBOLS = [
-    "BTCUSDT", "ETHUSDT", "BNBUSDT", "SOLUSDT",
-    "XRPUSDT", "DOGEUSDT", "ADAUSDT", "LTCUSDT",
-    "TRXUSDT", "LINKUSDT",
-]
+POLL_SECONDS = 15
+HTTP_TIMEOUT = aiohttp.ClientTimeout(total=15)
 
 INTERVALS = {
     "1m": 60,
     "5m": 300,
     "15m": 900,
+    "1h": 3600,
+    "6h": 21600,
+    "1d": 86400,
 }
+HIGHER_TF = {
+    "1m": "5m",
+    "5m": "15m",
+    "15m": "1h",
+    "1h": "6h",
+    "6h": "1d",
+    "1d": "1d",
+}
+PRODUCT_CACHE_SECONDS = 300
+_products_cache = {}
+_products_cache_time = 0.0
+watch_jobs = {}
+last_watch_state = {}
 
 
-def valid_symbol(symbol):
-    return symbol.upper() in SYMBOLS
-
-
-def coinbase_symbol(symbol):
-    symbol = symbol.upper()
-
-    if not valid_symbol(symbol):
-        raise ValueError("Неизвестная торговая пара")
-
-    return symbol[:-4] + "-USD"
-
-
-async def coinbase_get(path, params=None):
-    timeout = aiohttp.ClientTimeout(total=20)
-    headers = {
-        "User-Agent": "SEIRANBOT/2.0",
-        "Accept": "application/json",
-    }
-
-    async with aiohttp.ClientSession(
-        timeout=timeout,
-        headers=headers
-    ) as session:
-        async with session.get(
-            COINBASE_URL + path,
-            params=params
-        ) as response:
+async def api_get(path, params=None):
+    headers = {"User-Agent": "SEIRANBOT/4.0", "Accept": "application/json"}
+    async with aiohttp.ClientSession(timeout=HTTP_TIMEOUT, headers=headers) as session:
+        async with session.get(BASE_URL + path, params=params) as response:
+            body = await response.text()
             if response.status != 200:
-                body = await response.text()
-                raise RuntimeError(
-                    f"Coinbase HTTP {response.status}: {body[:200]}"
-                )
+                raise RuntimeError(f"Биржа вернула HTTP {response.status}: {body[:180]}")
+            try:
+                return json.loads(body)
+            except json.JSONDecodeError as exc:
+                raise RuntimeError("Биржа вернула неправильный ответ") from exc
 
-            return await response.json()
+
+async def get_products(force=False):
+    global _products_cache, _products_cache_time
+    now = asyncio.get_running_loop().time()
+    if not force and _products_cache and now - _products_cache_time < PRODUCT_CACHE_SECONDS:
+        return dict(_products_cache)
+    data = await api_get("/products")
+    if not isinstance(data, list):
+        raise RuntimeError("Не удалось получить список торговых пар")
+    products = {}
+    for item in data:
+        if not isinstance(item, dict):
+            continue
+        if item.get("quote_currency") != "USD":
+            continue
+        if item.get("status") not in (None, "online") or item.get("trading_disabled") is True:
+            continue
+        product_id = item.get("id")
+        if product_id:
+            products[product_id] = product_id
+    if not products:
+        raise RuntimeError("Список активных USD-пар пуст")
+    _products_cache = dict(sorted(products.items()))
+    _products_cache_time = now
+    return dict(_products_cache)
 
 
-async def get_price(symbol):
-    product = coinbase_symbol(symbol)
-    data = await coinbase_get(
-        f"/products/{product}/ticker"
+async def resolve_product(symbol):
+    symbol = (symbol or DEFAULT_SYMBOL).upper().strip().replace("/", "-")
+    products = await get_products()
+    candidates = [symbol]
+    if "-" not in symbol:
+        if symbol.endswith("USDT"):
+            base = symbol[:-4]
+        elif symbol.endswith("USD"):
+            base = symbol[:-3]
+        else:
+            base = symbol
+        candidates.append(base + "-USD")
+    for candidate in candidates:
+        if candidate in products:
+            return candidate
+    raise ValueError(f"Пара {symbol} не найдена на Coinbase USD. Команда /symbols покажет список.")
+
+
+async def get_ticker(product_id):
+    data = await api_get(f"/products/{product_id}/ticker")
+    return float(data["price"]), data.get("time")
+
+
+async def get_candles(product_id, interval):
+    raw = await api_get(
+        f"/products/{product_id}/candles",
+        {"granularity": INTERVALS[interval]},
     )
-    return float(data["price"])
+    if not isinstance(raw, list):
+        raise RuntimeError("Биржа не вернула свечи")
+    candles = sorted(
+        [row for row in raw if isinstance(row, list) and len(row) >= 6],
+        key=lambda row: int(row[0]),
+    )
+    # Remove the currently-forming candle; use only completed candles for indicators.
+    if len(candles) > 1:
+        candles = candles[:-1]
+    if len(candles) < 60:
+        raise RuntimeError(f"Мало исторических свечей для {interval}: {len(candles)}")
+    return candles
 
 
-def calculate_ema(values, period):
+def ema(values, period):
     if len(values) < period:
-        raise ValueError("Недостаточно данных для EMA")
-
-    multiplier = 2 / (period + 1)
-    ema = sum(values[:period]) / period
-
+        raise ValueError("Недостаточно свечей для EMA")
+    alpha = 2.0 / (period + 1.0)
+    result = sum(values[:period]) / period
     for value in values[period:]:
-        ema = value * multiplier + ema * (1 - multiplier)
+        result = alpha * value + (1.0 - alpha) * result
+    return result
 
-    return ema
 
-
-def calculate_rsi(values, period=14):
-    if len(values) < period + 1:
+def rsi(values, period=14):
+    if len(values) <= period:
         raise ValueError("Недостаточно данных для RSI")
-
-    changes = [
-        values[i] - values[i - 1]
-        for i in range(1, len(values))
-    ]
-
-    recent = changes[-period:]
-    gains = [max(x, 0) for x in recent]
-    losses = [max(-x, 0) for x in recent]
-
-    avg_gain = sum(gains) / period
-    avg_loss = sum(losses) / period
-
+    changes = [values[i] - values[i - 1] for i in range(1, len(values))]
+    gains = [max(x, 0.0) for x in changes]
+    losses = [max(-x, 0.0) for x in changes]
+    avg_gain = sum(gains[:period]) / period
+    avg_loss = sum(losses[:period]) / period
+    for i in range(period, len(gains)):
+        avg_gain = (avg_gain * (period - 1) + gains[i]) / period
+        avg_loss = (avg_loss * (period - 1) + losses[i]) / period
     if avg_loss == 0:
         return 100.0 if avg_gain > 0 else 50.0
-
     rs = avg_gain / avg_loss
-    return 100 - (100 / (1 + rs))
+    return 100.0 - (100.0 / (1.0 + rs))
 
 
-def calculate_atr(candles, period=14):
+def atr(candles, period=14):
     if len(candles) < period + 1:
         raise ValueError("Недостаточно данных для ATR")
-
-    true_ranges = []
-
+    ranges = []
     for i in range(1, len(candles)):
-        high = float(candles[i][2])
         low = float(candles[i][1])
-        previous_close = float(candles[i - 1][4])
-
-        true_range = max(
-            high - low,
-            abs(high - previous_close),
-            abs(low - previous_close),
-        )
-        true_ranges.append(true_range)
-
-    return sum(true_ranges[-period:]) / period
+        high = float(candles[i][2])
+        prev_close = float(candles[i - 1][4])
+        ranges.append(max(high - low, abs(high - prev_close), abs(low - prev_close)))
+    return sum(ranges[-period:]) / period
 
 
-def calculate_macd(values):
-    if len(values) < 35:
+def macd_histogram(values):
+    if len(values) < 40:
         raise ValueError("Недостаточно данных для MACD")
+    fast = ema(values, 12)    slow = ema(values, 26)
+    macd_line = fast - slow
+    # Signal-line approximation is calculated from the MACD series.
+    macd_series = []
+    for end in range(26, len(values) + 1):
+        macd_series.append(ema(values[:end], 12) - ema(values[:end], 26))
+    signal_line = ema(macd_series, 9)
+    return macd_line - signal_line
 
-    ema12 = calculate_ema(values, 12)
-    ema26 = calculate_ema(values, 26)
-    return ema12 - ema26
+
+def volume_confirmation(candles):
+    volumes = [float(c[5]) for c in candles]
+    if len(volumes) < 21:
+        return False, 0.0
+    average = sum(volumes[-21:-1]) / 20.0
+    ratio = volumes[-1] / average if average > 0 else 0.0
+    return ratio >= 1.05, ratio
 
 
-async def make_analysis(symbol, interval):
-    product = coinbase_symbol(symbol)
+def timeframe_metrics(candles):
+    closes = [float(c[4]) for c in candles]
+    last = closes[-1]
+    e20 = ema(closes, 20)
+    e50 = ema(closes, 50)
+    r = rsi(closes)
+    m = macd_histogram(closes)
+    volume_ok, volume_ratio = volume_confirmation(candles)
+    direction = 1 if e20 > e50 and last > e20 else (-1 if e20 < e50 and last < e20 else 0)
+    return {
+        "close": last,
+        "ema20": e20,
+        "ema50": e50,
+        "rsi": r,
+        "macd_hist": m,
+        "direction": direction,
+        "volume_ok": volume_ok,
+        "volume_ratio": volume_ratio,
+        "atr": atr(candles),
+        "candle_time": int(candles[-1][0]),
+    }
 
-    candles = await coinbase_get(
-        f"/products/{product}/candles",
-        {"granularity": INTERVALS[interval]}
-    )
 
-    if not isinstance(candles, list):
-        raise RuntimeError("Coinbase вернул неверные данные")
-
-    candles = sorted(candles, key=lambda x: x[0])
-    candles = candles[:-1]
-
-    if len(candles) < 60:
-        raise RuntimeError(
-            f"Недостаточно свечей: получено {len(candles)}"
-        )
-
-    prices = [float(candle[4]) for candle in candles]
-    price = prices[-1]
-
-    ema20 = calculate_ema(prices, 20)
-    ema50 = calculate_ema(prices, 50)
-    rsi = calculate_rsi(prices, 14)
-    macd = calculate_macd(prices)
-    atr = calculate_atr(candles, 14)
-
+def build_signal(symbol, interval, price, main, higher, ticker_time):
     score = 0
     reasons = []
-
-    # Подтверждение тренда
-    if ema20 > ema50 and price > ema20:
-        score += 1
-        reasons.append("Тренд вверх")
-
-    elif ema20 < ema50 and price < ema20:
-        score -= 1
-        reasons.append("Тренд вниз")
-
+    direction = main["direction"]
+    if direction:
+        score += direction * 2
+        reasons.append("Тренд EMA и положение цены подтверждают направление")
     else:
-        reasons.append("Тренд не подтверждён")
+        reasons.append("Основной тренд пока не определён")
 
-    # MACD
-    if macd > 0:
+    if main["macd_hist"] > 0:
         score += 1
-        reasons.append("MACD положительный")
-
-    elif macd < 0:
+        reasons.append("Импульс MACD положительный")
+    elif main["macd_hist"] < 0:
         score -= 1
-        reasons.append("MACD отрицательный")
+        reasons.append("Импульс MACD отрицательный")
 
-    # RSI
-    if 50 < rsi < 70:
+    if 52 <= main["rsi"] <= 68:
         score += 1
-        reasons.append("RSI поддерживает BUY")
-
-    elif 30 < rsi < 50:
+        reasons.append("RSI поддерживает рост без сильной перекупленности")
+    elif 32 <= main["rsi"] <= 48:
         score -= 1
-        reasons.append("RSI поддерживает SELL")
+        reasons.append("RSI поддерживает снижение без сильной перепроданности")
+    elif main["rsi"] > 72:
+        reasons.append("RSI высокий: вход в покупку рискован")
+    elif main["rsi"] < 28:
+        reasons.append("RSI низкий: вход в продажу рискован")
 
-    elif rsi >= 70:
-        reasons.append("Перекупленность: BUY запрещён")
+    higher_direction = higher["direction"]
+    if higher_direction == direction and direction != 0:
+        score += direction
+        reasons.append("Старший таймфрейм подтверждает направление")
+    else:
+        reasons.append("Старший таймфрейм не подтверждает направление")
 
-    elif rsi <= 30:
-        reasons.append("Перепроданность: SELL запрещён")
+    if main["volume_ok"]:
+        score += 1 if direction > 0 else (-1 if direction < 0 else 0)
+        reasons.append(f"Объём выше среднего ({main['volume_ratio']:.2f}x)")
+    else:
+        reasons.append(f"Объём не усиливает движение ({main['volume_ratio']:.2f}x)")
 
-    # Итоговый сигнал
-    if score >= 2 and rsi < 70:
+    # Require trend + momentum + higher-timeframe agreement; otherwise WAIT.
+    if score >= 4 and direction == 1 and higher_direction == 1 and main["rsi"] < 72:
         signal = "BUY 🟢"
-        stop_loss = price - atr * 1.5
-        take_profit = price + atr * 3
-
-    elif score <= -2 and rsi > 30:
+        stop = price - 1.5 * main["atr"]
+        target = price + 2.5 * main["atr"]
+    elif score <= -4 and direction == -1 and higher_direction == -1 and main["rsi"] > 28:
         signal = "SELL 🔴"
-        stop_loss = price + atr * 1.5
-        take_profit = price - atr * 3
-
+        stop = price + 1.5 * main["atr"]
+        target = price - 2.5 * main["atr"]
     else:
         signal = "WAIT 🟡"
-        stop_loss = None
-        take_profit = None
+        stop = target = None
 
-    if stop_loss is None:
-        risk_text = "Нет активной сделки"
-    else:
-        risk_text = (
-            f"Stop Loss: {stop_loss:.8g}\n"
-            f"Take Profit: {take_profit:.8g}"
-        )
+    now_text = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+    quote_time = ticker_time or "время биржи не указано"
+    stop_text = "—"
+    target_text = "—"
+    if stop is not None:
+        stop_text = f"{stop:.8g} USD"
+        target_text = f"{target:.8g} USD"
 
-    reasons_text = "\n".join(
-        f"• {reason}" for reason in reasons
+    reasons_text = "\n".join("• " + x for x in reasons)
+    strength = min(100, round(abs(score) / 6 * 100))
+    return {
+        "signal": signal,
+        "score": score,
+        "price": price,
+        "candle_time": main["candle_time"],
+        "text": (
+            f"🤖 SEIRANBOT — LIVE SIGNAL\n\n"
+            f"Рынок: Coinbase Spot ({symbol})\n"
+            f"Текущая цена: {price:.8g} USD\n"
+            f"Таймфрейм входа: {interval}\n"
+            f"Подтверждение: {HIGHER_TF[interval]}\n"
+            f"Сигнал: {signal}\n"
+            f"Оценка совпадения условий: {strength}% (не вероятность прибыли)\n\n"
+            f"RSI: {main['rsi']:.1f}\n"
+            f"MACD histogram: {main['macd_hist']:.8g}\n"
+            f"EMA 20: {main['ema20']:.8g}\n"
+            f"EMA 50: {main['ema50']:.8g}\n"
+            f"Объём / средний: {main['volume_ratio']:.2f}x\n"
+            f"Старший тренд: {'ВВЕРХ' if higher_direction == 1 else 'ВНИЗ' if higher_direction == -1 else 'НЕЙТРАЛЬНЫЙ'}\n\n"
+            f"Причины:\n{reasons_text}\n\n"
+            f"Расчётный Stop Loss: {stop_text}\n"
+            f"Расчётный Take Profit: {target_text}\n"
+            f"Время сигнала: {now_text}\n"
+            f"Время котировки биржи: {quote_time}\n\n"
+            f"Обновление наблюдения: примерно каждые {POLL_SECONDS} сек.\n"
+            f"Важно: это аналитический сигнал, не гарантия результата и не команда на автоматическую сделку. "
+            f"Coinbase USD может отличаться от котировок Pocket Option/OTC. Сначала проверяй на демо."
+        ),
+    }
+
+
+async def analyze_market(symbol, interval):
+    if interval not in INTERVALS:
+        raise ValueError("Таймфрейм должен быть: " + ", ".join(INTERVALS))
+    product_id = await resolve_product(symbol)
+    higher_interval = HIGHER_TF[interval]
+    # Fetch two timeframes and the live ticker concurrently.
+    main_candles, higher_candles, ticker = await asyncio.gather(
+        get_candles(product_id, interval),
+        get_candles(product_id, higher_interval),
+        get_ticker(product_id),
     )
+    main = timeframe_metrics(main_candles)
+    higher = timeframe_metrics(higher_candles)    price, ticker_time = ticker
+    return build_signal(product_id, interval, price, main, higher, ticker_time)
 
-    return (
-        f"🤖 SEIRANBOT V2 — АНАЛИЗ\n\n"
-        f"Инструмент: {symbol}\n"
-        f"Биржа: Coinbase\n"
-        f"Таймфрейм: {interval}\n"
-        f"Цена: {price:.8g} USD\n\n"
-        f"EMA 20: {ema20:.8g}\n"
-        f"EMA 50: {ema50:.8g}\n"
-        f"RSI 14: {rsi:.2f}\n"
-        f"MACD: {macd:.8g}\n"
-        f"ATR 14: {atr:.8g}\n\n"
-        f"Сигнал: {signal}\n"
-        f"Сила сигнала: {abs(score)}/3\n\n"
-        f"Причины:\n{reasons_text}\n\n"
-        f"{risk_text}\n\n"
-        f"⚠️ Технический анализ не гарантирует прибыль."
-    )
+
+def timeframe_keyboard(symbol):
+    rows = []
+    names = list(INTERVALS)
+    for i in range(0, len(names), 3):
+        rows.append([
+            InlineKeyboardButton(name, callback_data=f"sig:{symbol}:{name}")
+            for name in names[i:i + 3]
+        ])
+    return InlineKeyboardMarkup(rows)
+
+
+def pairs_keyboard(products, page=0):
+    symbols = list(products)
+    page_size = 18
+    start = page * page_size
+    current = symbols[start:start + page_size]
+    rows = []
+    for i in range(0, len(current), 3):
+        rows.append([
+            InlineKeyboardButton(s, callback_data=f"pair:{s}")
+            for s in current[i:i + 3]
+        ])
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton("⬅️", callback_data=f"page:{page - 1}"))
+    if start + page_size < len(symbols):
+        nav.append(InlineKeyboardButton("➡️", callback_data=f"page:{page + 1}"))
+    if nav:
+        rows.append(nav)
+    return InlineKeyboardMarkup(rows)
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
+    message = (
         "Привет! Я SEIRANBOT 🤖\n\n"
-        "Получаю бесплатные криптокотировки Coinbase.\n\n"
+        "Получаю онлайн-котировки Coinbase и формирую сигналы BUY / SELL / WAIT.\n\n"
         "Команды:\n"
-        "/symbols — список инструментов\n"
-        "/price BTCUSDT — текущая цена\n"
-        "/signal BTCUSDT 5m — сигнал\n"
-        "/analysis ETHUSDT 15m — анализ\n"
+        "/menu — выбрать пару и таймфрейм\n"
+        "/symbols — список доступных пар\n"
+        "/price BTC-USD — текущая цена\n"
+        "/signal BTC-USD 1m — получить сигнал\n"
+        "/watch BTC-USD 1m — включить онлайн-наблюдение\n"
+        "/unwatch — выключить наблюдение\n"
+        "/scan 5m — сканировать пары (может занять время)\n"
         "/help — помощь\n\n"
-        "Таймфреймы: 1m, 5m, 15m"
+        "Таймфреймы: 1m, 5m, 15m, 1h, 6h, 1d.\n"
+        f"Наблюдение обновляется примерно раз в {POLL_SECONDS} секунд."
     )
+    await update.message.reply_text(message)
+    await menu_command(update, context)
 
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await start(update, context)
 
 
+async def menu_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        products = await get_products()
+        await update.message.reply_text(
+            f"Выбери торговую пару Coinbase USD ({len(products)} рынков):",
+            reply_markup=pairs_keyboard(products),
+        )
+    except Exception as exc:
+        log.exception("Menu error")
+        await update.message.reply_text(f"Не удалось загрузить пары: {exc}")
+
+
 async def symbols_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "Доступные инструменты:\n\n"
-        + "\n".join(SYMBOLS)
-        + "\n\nПример: /signal BTCUSDT 5m"
-    )
+    try:
+        products = await get_products(force=True)
+        text = "Доступные рынки Coinbase USD:\n" + "\n".join(products)
+        for offset in range(0, len(text), 3500):
+            await update.message.reply_text(text[offset:offset + 3500])
+    except Exception as exc:
+        log.exception("Symbols error")
+        await update.message.reply_text(f"Ошибка списка пар: {exc}")
 
 
 async def price_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    symbol = DEFAULT_SYMBOL
-
-    if context.args:
-        symbol = context.args[0].upper()
-
-    if not valid_symbol(symbol):
-        await update.message.reply_text(
-            "Неверная пара. Напиши /symbols."
-        )
-        return
-
+    symbol = context.args[0] if context.args else DEFAULT_SYMBOL
     try:
-        price = await get_price(symbol)
+        product = await resolve_product(symbol)
+        price, stamp = await get_ticker(product)
         await update.message.reply_text(
-            f"{symbol}\nЦена: {price:.8g} USD\nИсточник: Coinbase"
+            f"{product}\nЦена: {price:.8g} USD\nВремя биржи: {stamp or 'не указано'}"
         )
-
-    except Exception as error:
-        logging.exception("Price error")
-        await update.message.reply_text(
-            f"Ошибка получения цены: {error}"
-        )
+    except Exception as exc:
+        log.exception("Price error")
+        await update.message.reply_text(f"Ошибка цены: {exc}")
 
 
 async def signal_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    symbol = DEFAULT_SYMBOL
-    interval = DEFAULT_INTERVAL
+    symbol = context.args[0] if context.args else DEFAULT_SYMBOL
+    interval = context.args[1].lower() if len(context.args) > 1 else DEFAULT_INTERVAL
+    status = await update.message.reply_text("⏳ Получаю котировку и проверяю два таймфрейма...")
+    try:
+        result = await analyze_market(symbol, interval)
+        await status.edit_text(result["text"])
+    except Exception as exc:
+        log.exception("Signal error")
+        await status.edit_text(f"Не удалось сформировать сигнал: {exc}")
 
-    if len(context.args) >= 1:
-        symbol = context.args[0].upper()
 
-    if len(context.args) >= 2:
-        interval = context.args[1].lower()
+async def watch_job(context: ContextTypes.DEFAULT_TYPE):
+    job = context.job
+    chat_id = job.chat_id
+    symbol = job.data["symbol"]
+    interval = job.data["interval"]
+    key = (chat_id, symbol, interval)
+    try:
+        result = await analyze_market(symbol, interval)
+        current = result["signal"]
+        previous = last_watch_state.get(key)
+        # Notify on a new BUY/SELL state only; avoid flooding repeated alerts.
+        if current in ("BUY 🟢", "SELL 🔴") and current != previous:
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text="🔔 НОВЫЙ LIVE-СИГНАЛ\n\n" + result["text"],
+            )
+        last_watch_state[key] = current
+    except Exception as exc:
+        log.warning("Watch error %s %s: %s", symbol, interval, exc)
 
-    if not valid_symbol(symbol):
+
+async def watch_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if context.job_queue is None:
         await update.message.reply_text(
-            "Неверная пара. Напиши /symbols."
+            "Не установлен JobQueue. Проверь requirements.txt: нужна зависимость python-telegram-bot[job-queue]."
         )
         return
-
-    if interval not in INTERVALS:
-        await update.message.reply_text(
-            "Выбери таймфрейм: 1m, 5m или 15m."
-        )
+    symbol = context.args[0] if context.args else DEFAULT_SYMBOL
+    interval = context.args[1].lower() if len(context.args) > 1 else DEFAULT_INTERVAL
+    try:
+        product = await resolve_product(symbol)
+        if interval not in INTERVALS:
+            raise ValueError("Таймфреймы: " + ", ".join(INTERVALS))
+        await analyze_market(product, interval)  # Validate data before enabling the job.
+    except Exception as exc:
+        await update.message.reply_text(f"Нельзя включить наблюдение: {exc}")
         return
 
-    status = await update.message.reply_text(
-        "⏳ Анализирую рынок..."
+    chat_id = update.effective_chat.id
+    old_job = watch_jobs.pop(chat_id, None)
+    if old_job:
+        old_job.schedule_removal()    for key in list(last_watch_state):
+        if key[0] == chat_id:
+            last_watch_state.pop(key, None)
+    job = context.job_queue.run_repeating(
+        watch_job,
+        interval=POLL_SECONDS,
+        first=1,
+        chat_id=chat_id,
+        name=f"live-watch-{chat_id}",
+        data={"symbol": product, "interval": interval},
+    )
+    watch_jobs[chat_id] = job
+    await update.message.reply_text(
+        f"🟢 Онлайн-наблюдение включено\nПара: {product}\nТаймфрейм: {interval}\n"
+        f"Проверка примерно каждые {POLL_SECONDS} секунд.\n"
+        "Сообщу при появлении нового BUY или SELL. /unwatch — остановить."
     )
 
+
+async def unwatch_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    job = watch_jobs.pop(chat_id, None)
+    if job:
+        job.schedule_removal()
+        for key in list(last_watch_state):
+            if key[0] == chat_id:
+                last_watch_state.pop(key, None)
+        await update.message.reply_text("🔕 Онлайн-наблюдение выключено.")
+    else:
+        await update.message.reply_text("Сейчас наблюдение не включено.")
+
+
+async def scan_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    interval = context.args[0].lower() if context.args else "5m"
+    if interval not in INTERVALS:
+        await update.message.reply_text("Таймфреймы: " + ", ".join(INTERVALS))
+        return
+    status = await update.message.reply_text("⏳ Сканирую рынки Coinbase. Это может занять время...")
     try:
-        result = await make_analysis(symbol, interval)
-        await status.edit_text(result)
+        products = await get_products()
+        semaphore = asyncio.Semaphore(3)
 
-    except Exception as error:
-        logging.exception("Signal error")
-        await status.edit_text(
-            f"Ошибка анализа: {error}"
-        )
+        async def one(symbol):
+            async with semaphore:
+                try:
+                    return await analyze_market(symbol, interval)
+                except Exception as exc:
+                    log.debug("Scan skip %s: %s", symbol, exc)
+                    return None
+
+        results = await asyncio.gather(*(one(s) for s in products))
+        valid = [r for r in results if r]
+        signals = [r for r in valid if r["signal"] != "WAIT 🟡"]
+        lines = [
+            f"🤖 SEIRANBOT — СКАН {interval}",
+            f"Проверено успешно: {len(valid)} из {len(products)}",
+            f"Сигналов BUY/SELL: {len(signals)}",
+            "",
+        ]
+        for r in signals[:35]:
+            lines.append(f"{r['signal']} | {r['text'].splitlines()[2]} | score {r['score']}")
+        if not signals:
+            lines.append("Сейчас нет сигналов, прошедших фильтры. Состояние: WAIT.")
+        lines.append("\nКотировки Coinbase USD могут отличаться от Pocket Option/OTC. Проверяй на демо.")
+        output = "\n".join(lines)
+        await status.edit_text(output[:4000])
+    except Exception as exc:
+        log.exception("Scan error")
+        await status.edit_text(f"Ошибка сканирования: {exc}")
 
 
-async def analysis_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await signal_command(update, context)
+async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    data = query.data or ""
+    try:
+        if data.startswith("page:"):
+            page = int(data.split(":", 1)[1])
+            products = await get_products()
+            await query.edit_message_reply_markup(reply_markup=pairs_keyboard(products, page))
+        elif data.startswith("pair:"):
+            symbol = data.split(":", 1)[1]
+            await query.edit_message_text(
+                f"Выбрана пара {symbol}. Выбери таймфрейм:",
+                reply_markup=timeframe_keyboard(symbol),
+            )
+        elif data.startswith("sig:"):
+            _, symbol, interval = data.split(":", 2)
+            await query.edit_message_text("⏳ Получаю онлайн-котировку и сигнал...")
+            result = await analyze_market(symbol, interval)
+            await query.edit_message_text(
+                result["text"],
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("🔄 Обновить", callback_data=f"sig:{symbol}:{interval}")
+                ]]),
+            )
+    except Exception as exc:
+        log.exception("Callback error")
+        await query.message.reply_text(f"Ошибка: {exc}")
 
 
 def main():
     if not BOT_TOKEN:
-        raise RuntimeError(
-            "Не задан BOT_TOKEN в переменных окружения."
-        )
-
-    application = (
-        Application.builder()
-        .token(BOT_TOKEN)
-        .build()
-    )
-
-    application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("help", help_command))
-    application.add_handler(CommandHandler("symbols", symbols_command))
-    application.add_handler(CommandHandler("price", price_command))
-    application.add_handler(CommandHandler("signal", signal_command))
-    application.add_handler(CommandHandler("analysis", analysis_command))
-
-    logging.info("SEIRANBOT V2 запущен")
-    application.run_polling()
+        raise RuntimeError("В Render не задан BOT_TOKEN. Добавь его в Environment, не меняя существующий токен.")
+    app = Application.builder().token(BOT_TOKEN).build()
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("help", help_command))
+    app.add_handler(CommandHandler("menu", menu_command))
+    app.add_handler(CommandHandler("symbols", symbols_command))
+    app.add_handler(CommandHandler("price", price_command))
+    app.add_handler(CommandHandler("signal", signal_command))
+    app.add_handler(CommandHandler("analysis", signal_command))
+    app.add_handler(CommandHandler("watch", watch_command))
+    app.add_handler(CommandHandler("unwatch", unwatch_command))
+    app.add_handler(CommandHandler("scan", scan_command))
+    app.add_handler(CallbackQueryHandler(callback_handler))
+    log.info("SEIRANBOT FINAL starting")
+    app.run_polling(drop_pending_updates=True)
 
 
 if __name__ == "__main__":
     main()
-    
