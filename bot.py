@@ -327,7 +327,8 @@ async def analyze_market(symbol, interval):
         get_ticker(product_id),
     )
     main = timeframe_metrics(main_candles)
-    higher = timeframe_metrics(higher_candles)    price, ticker_time = ticker
+    higher = timeframe_metrics(higher_candles) 
+    price, ticker_time = ticker
     return build_signal(product_id, interval, price, main, higher, ticker_time)
 
 
