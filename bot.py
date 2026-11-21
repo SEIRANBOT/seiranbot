@@ -177,7 +177,8 @@ def atr(candles, period=14):
 def macd_histogram(values):
     if len(values) < 40:
         raise ValueError("Недостаточно данных для MACD")
-    fast = ema(values, 12)    slow = ema(values, 26)
+    fast = ema(values, 12)  
+    slow = ema(values, 26)
     macd_line = fast - slow
     # Signal-line approximation is calculated from the MACD series.
     macd_series = []
