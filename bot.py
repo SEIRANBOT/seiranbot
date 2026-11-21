@@ -1,14 +1,9 @@
-
 import os
 import logging
 import aiohttp
 
 from telegram import Update
-from telegram.ext import (
-    Application,
-    CommandHandler,
-    ContextTypes,
-)
+from telegram.ext import Application, CommandHandler, ContextTypes
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -49,9 +44,8 @@ def coinbase_symbol(symbol):
 
 async def coinbase_get(path, params=None):
     timeout = aiohttp.ClientTimeout(total=20)
-
     headers = {
-        "User-Agent": "SEIRANBOT/1.0",
+        "User-Agent": "SEIRANBOT/2.0",
         "Accept": "application/json",
     }
 
@@ -59,12 +53,10 @@ async def coinbase_get(path, params=None):
         timeout=timeout,
         headers=headers
     ) as session:
-
         async with session.get(
             COINBASE_URL + path,
             params=params
         ) as response:
-
             if response.status != 200:
                 body = await response.text()
                 raise RuntimeError(
@@ -76,38 +68,10 @@ async def coinbase_get(path, params=None):
 
 async def get_price(symbol):
     product = coinbase_symbol(symbol)
-
     data = await coinbase_get(
         f"/products/{product}/ticker"
     )
-
     return float(data["price"])
-
-
-async def get_candles(symbol, interval):
-    product = coinbase_symbol(symbol)
-
-    granularity = INTERVALS[interval]
-
-    data = await coinbase_get(
-        f"/products/{product}/candles",
-        {"granularity": granularity}
-    )
-
-    if not isinstance(data, list):
-        raise RuntimeError("Coinbase вернул неверные данные")
-
-    candles = sorted(data, key=lambda x: x[0])
-
-    # Coinbase возвращает свечи:
-    # [время, low, high, open, close, volume]
-
-    prices = [float(candle[4]) for candle in candles]
-
-    if len(prices) > 1:
-        prices = prices[:-1]
-
-    return prices
 
 
 def calculate_ema(values, period):
@@ -115,7 +79,6 @@ def calculate_ema(values, period):
         raise ValueError("Недостаточно данных для EMA")
 
     multiplier = 2 / (period + 1)
-
     ema = sum(values[:period]) / period
 
     for value in values[period:]:
@@ -134,7 +97,6 @@ def calculate_rsi(values, period=14):
     ]
 
     recent = changes[-period:]
-
     gains = [max(x, 0) for x in recent]
     losses = [max(-x, 0) for x in recent]
 
@@ -145,7 +107,6 @@ def calculate_rsi(values, period=14):
         return 100.0 if avg_gain > 0 else 50.0
 
     rs = avg_gain / avg_loss
-
     return 100 - (100 / (1 + rs))
 
 
@@ -165,7 +126,6 @@ def calculate_atr(candles, period=14):
             abs(high - previous_close),
             abs(low - previous_close),
         )
-
         true_ranges.append(true_range)
 
     return sum(true_ranges[-period:]) / period
@@ -177,7 +137,6 @@ def calculate_macd(values):
 
     ema12 = calculate_ema(values, 12)
     ema26 = calculate_ema(values, 26)
-
     return ema12 - ema26
 
 
@@ -189,9 +148,10 @@ async def make_analysis(symbol, interval):
         {"granularity": INTERVALS[interval]}
     )
 
-    candles = sorted(candles, key=lambda x: x[0])
+    if not isinstance(candles, list):
+        raise RuntimeError("Coinbase вернул неверные данные")
 
-    # Не анализируем текущую незакрытую свечу.
+    candles = sorted(candles, key=lambda x: x[0])
     candles = candles[:-1]
 
     if len(candles) < 60:
@@ -200,39 +160,60 @@ async def make_analysis(symbol, interval):
         )
 
     prices = [float(candle[4]) for candle in candles]
-
     price = prices[-1]
 
     ema20 = calculate_ema(prices, 20)
     ema50 = calculate_ema(prices, 50)
-
     rsi = calculate_rsi(prices, 14)
     macd = calculate_macd(prices)
     atr = calculate_atr(candles, 14)
 
     score = 0
+    reasons = []
 
-    if ema20 > ema50:
+    # Подтверждение тренда
+    if ema20 > ema50 and price > ema20:
         score += 1
-    elif ema20 < ema50:
-        score -= 1
+        reasons.append("Тренд вверх")
 
+    elif ema20 < ema50 and price < ema20:
+        score -= 1
+        reasons.append("Тренд вниз")
+
+    else:
+        reasons.append("Тренд не подтверждён")
+
+    # MACD
     if macd > 0:
         score += 1
+        reasons.append("MACD положительный")
+
     elif macd < 0:
         score -= 1
+        reasons.append("MACD отрицательный")
 
+    # RSI
     if 50 < rsi < 70:
         score += 1
+        reasons.append("RSI поддерживает BUY")
+
     elif 30 < rsi < 50:
         score -= 1
+        reasons.append("RSI поддерживает SELL")
 
-    if score >= 2:
+    elif rsi >= 70:
+        reasons.append("Перекупленность: BUY запрещён")
+
+    elif rsi <= 30:
+        reasons.append("Перепроданность: SELL запрещён")
+
+    # Итоговый сигнал
+    if score >= 2 and rsi < 70:
         signal = "BUY 🟢"
         stop_loss = price - atr * 1.5
         take_profit = price + atr * 3
 
-    elif score <= -2:
+    elif score <= -2 and rsi > 30:
         signal = "SELL 🔴"
         stop_loss = price + atr * 1.5
         take_profit = price - atr * 3
@@ -250,8 +231,12 @@ async def make_analysis(symbol, interval):
             f"Take Profit: {take_profit:.8g}"
         )
 
+    reasons_text = "\n".join(
+        f"• {reason}" for reason in reasons
+    )
+
     return (
-        f"🤖 SEIRANBOT — АНАЛИЗ\n\n"
+        f"🤖 SEIRANBOT V2 — АНАЛИЗ\n\n"
         f"Инструмент: {symbol}\n"
         f"Биржа: Coinbase\n"
         f"Таймфрейм: {interval}\n"
@@ -263,6 +248,7 @@ async def make_analysis(symbol, interval):
         f"ATR 14: {atr:.8g}\n\n"
         f"Сигнал: {signal}\n"
         f"Сила сигнала: {abs(score)}/3\n\n"
+        f"Причины:\n{reasons_text}\n\n"
         f"{risk_text}\n\n"
         f"⚠️ Технический анализ не гарантирует прибыль."
     )
@@ -308,14 +294,12 @@ async def price_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     try:
         price = await get_price(symbol)
-
         await update.message.reply_text(
             f"{symbol}\nЦена: {price:.8g} USD\nИсточник: Coinbase"
         )
 
     except Exception as error:
         logging.exception("Price error")
-
         await update.message.reply_text(
             f"Ошибка получения цены: {error}"
         )
@@ -349,12 +333,10 @@ async def signal_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     try:
         result = await make_analysis(symbol, interval)
-
         await status.edit_text(result)
 
     except Exception as error:
         logging.exception("Signal error")
-
         await status.edit_text(
             f"Ошибка анализа: {error}"
         )
@@ -383,8 +365,7 @@ def main():
     application.add_handler(CommandHandler("signal", signal_command))
     application.add_handler(CommandHandler("analysis", analysis_command))
 
-    logging.info("SEIRANBOT запущен")
-
+    logging.info("SEIRANBOT V2 запущен")
     application.run_polling()
 
 
