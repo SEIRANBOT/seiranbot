@@ -167,17 +167,30 @@ async def symbols_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+
 async def price_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     symbol = DEFAULT_SYMBOL
 
     if context.args:
         symbol = context.args[0].upper()
 
-    if not symbol.endswith("USDT"):
+    if not valid_symbol(symbol):
         await update.message.reply_text(
-            "Укажи пару в формате BTCUSDT."
+            "Неверная пара. Напиши /symbols для списка инструментов."
         )
         return
+
+    try:
+        price = await get_price(symbol)
+        await update.message.reply_text(
+            f"{symbol}\nЦена: {price:.8g} USD"
+        )
+    except Exception as error:
+        logging.exception("Price error")
+        await update.message.reply_text(
+            f"Не удалось получить цену: {error}"
+        )
+
 
     try:
         price = await get_price(symbol)
