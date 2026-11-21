@@ -52,32 +52,30 @@ async def coinbase_get(path, params=None):
 
 
 
+
 async def get_price(symbol):
-    data = await binance_get(
-        "/api/v3/ticker/price",
-        {"symbol": symbol}
+    data = await coinbase_get(
+        f"/products/{symbol}/ticker"
     )
     return float(data["price"])
 
 
 async def get_candles(symbol, interval):
-    data = await binance_get(
-        "/api/v3/klines",
-        {
-            "symbol": symbol,
-            "interval": interval,
-            "limit": 100,
-        }
+    granularity = {
+        "1m": 60,
+        "5m": 300,
+        "15m": 900
+    }.get(interval, 60)
+
+    data = await coinbase_get(
+        f"/products/{symbol}/candles",
+        {"granularity": granularity}
     )
 
-    # Последняя свеча может быть ещё не закрыта.
-    candles = data[:-1]
+    candles = sorted(data, key=lambda x: x[0])
+    candles = candles[:-1]
 
-    return [
-        float(candle[4])
-        for candle in candles
-    ]
-
+    return [float(candle[4]) for candle in candles]
 
 def calculate_ema(values, period):
     multiplier = 2 / (period + 1)
