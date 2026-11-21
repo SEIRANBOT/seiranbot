@@ -36,20 +36,20 @@ SYMBOLS = [
 
 INTERVALS = ["1m", "5m", "15m"]
 
-
-async def binance_get(path, params=None):
+async def coinbase_get(path, params=None):
     timeout = aiohttp.ClientTimeout(total=15)
 
     async with aiohttp.ClientSession(timeout=timeout) as session:
         async with session.get(
-            BINANCE_URL + path,
+            COINBASE_URL + path,
             params=params
         ) as response:
             if response.status != 200:
                 raise RuntimeError(
-                    f"Binance ответил с ошибкой: {response.status}"
+                    f"Coinbase ответил с ошибкой: {response.status}"
                 )
             return await response.json()
+
 
 
 async def get_price(symbol):
