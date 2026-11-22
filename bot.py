@@ -553,7 +553,93 @@ async def scan_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         results = await asyncio.gather(*(one(s) for s in products))
         valid = [r for r in results if r]
         signals = [r for r in valid if r["signal"] != "WAIT 🟡"]
+        
         lines = [
             f"🤖 SEIRANBOT — СКАН {interval}",
             f"Проверено успешно: {len(valid)} из {len(products)}",
             f"Сигналов BUY/SELL: {len(signals)}",
+        ]
+
+        if signals:
+            lines.append("")
+            lines.append("📊 НАЙДЕННЫЕ СИГНАЛЫ:")
+            for result in signals[:20]:
+                lines.append(
+                    f"{result['signal']} | "
+                    f"Цена: {result['price']:.8g} USD | "
+                    f"Оценка: {result['score']}"
+                )
+        else:
+            lines.append("")
+            lines.append("Сейчас активных сигналов BUY/SELL нет.")
+
+        lines.append("")
+        lines.append("⚠️ Coinbase Spot. Сигналы не гарантируют прибыль.")
+        output = "\n".join(lines)
+        await status.edit_text(output[:4000])
+
+    except Exception as exc:
+        log.exception("Scan error")
+        await status.edit_text(f"Ошибка сканирования: {exc}")
+
+
+async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    data = query.data or ""
+
+    try:
+        if data.startswith("pair:"):
+            symbol = data.split(":", 1)[1]
+            await query.edit_message_text(
+                f"Выбрана пара {symbol}. Выбери таймфрейм:",
+                reply_markup=timeframe_keyboard(symbol),
+            )
+
+        elif data.startswith("sig:"):
+            _, symbol, interval = data.split(":")
+            await query.edit_message_text("⏳ Анализирую рынок...")
+            result = await analyze_market(symbol, interval)
+            await query.edit_message_text(result["text"])
+
+        elif data.startswith("page:"):
+            page = int(data.split(":", 1)[1])
+            products = await get_products()
+            await query.edit_message_reply_markup(
+                reply_markup=pairs_keyboard(products, page)
+            )
+
+    except Exception as exc:
+        log.exception("Button error")
+        await query.edit_message_text(f"Ошибка: {exc}")
+
+
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
+    log.error("Ошибка Telegram: %s", context.error)
+
+
+def main():
+    if not BOT_TOKEN:
+        raise RuntimeError("Не задан BOT_TOKEN в Render Environment.")
+
+    application = Application.builder().token(BOT_TOKEN).build()
+
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("help", help_command))
+    application.add_handler(CommandHandler("menu", menu_command))
+    application.add_handler(CommandHandler("symbols", symbols_command))
+    application.add_handler(CommandHandler("price", price_command))
+    application.add_handler(CommandHandler("signal", signal_command))
+    application.add_handler(CommandHandler("watch", watch_command))
+    application.add_handler(CommandHandler("unwatch", unwatch_command))
+    application.add_handler(CommandHandler("scan", scan_command))
+    application.add_handler(CallbackQueryHandler(button_handler))
+    application.add_error_handler(error_handler)
+
+    log.info("SEIRANBOT запускается...")
+    application.run_polling(allowed_updates=Update.ALL_TYPES)
+
+
+if __name__ == "__main__":
+    main()
+    
