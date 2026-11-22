@@ -556,4 +556,4 @@ async def scan_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         lines = [
             f"🤖 SEIRANBOT — СКАН {interval}",
             f"Проверено успешно: {len(valid)} из {len(products)}",
-            f"Сигналов BUY/SELL: {len
+            f"Сигналов BUY/SELL: {len(signals)}",
