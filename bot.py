@@ -476,11 +476,14 @@ async def watch_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     chat_id = update.effective_chat.id
     old_job = watch_jobs.pop(chat_id, None)
+    
     if old_job:
-        old_job.schedule_removal()   
-        for key in list(last_watch_state):
+        old_job.schedule_removal()
+
+    for key in list(last_watch_state):
         if key[0] == chat_id:
             last_watch_state.pop(key, None)
+
     job = context.job_queue.run_repeating(
         watch_job,
         interval=POLL_SECONDS,
@@ -490,6 +493,25 @@ async def watch_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         data={"symbol": product, "interval": interval},
     )
     watch_jobs[chat_id] = job
+
+    old_job = watch_jobs.pop(chat_id, None)
+    if old_job:
+        old_job.schedule_removal()
+
+    for key in list(last_watch_state):
+        if key[0] == chat_id:
+            last_watch_state.pop(key, None)
+
+    job = context.job_queue.run_repeating(
+        watch_job,
+        interval=POLL_SECONDS,
+        first=1,
+        chat_id=chat_id,
+        name=f"live-watch-{chat_id}",
+        data={"symbol": product, "interval": interval},
+    )
+    watch_jobs[chat_id] = job
+    
     await update.message.reply_text(
         f"🟢 Онлайн-наблюдение включено\nПара: {product}\nТаймфрейм: {interval}\n"
         f"Проверка примерно каждые {POLL_SECONDS} секунд.\n"
