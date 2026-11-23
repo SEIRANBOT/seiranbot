@@ -26,6 +26,13 @@ logging.basicConfig(
 log = logging.getLogger("SEIRANBOT")
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+AI_MODEL = os.getenv("OPENAI_MODEL", "gpt-5.5")
+
+ai_client = (
+    AsyncOpenAI(api_key=OPENAI_API_KEY)
+    if OPENAI_API_KEY else None
+)
 BASE_URL = "https://api.exchange.coinbase.com"
 DEFAULT_SYMBOL = "BTC-USD"
 DEFAULT_INTERVAL = "5m"
