@@ -322,6 +322,75 @@ def build_signal(symbol, interval, price, main, higher, ticker_time):
         ),
     }
 
+async def ai_review_signal(result):
+    original = result["signal"]
+
+    if original not in ("BUY 🟢", "SELL 🔴"):
+        result["ai_review"] = "Технический сигнал отсутствует."
+        return result
+
+    if ai_client is None:
+        result["signal"] = "WAIT 🟡"
+        result["ai_review"] = "OpenAI API не подключён."
+        return result
+
+    instructions = """
+Ты SEIRAN AI — независимый фильтр технических сигналов.
+
+Проверь:
+1. Согласованность EMA и направления тренда.
+2. RSI и MACD.
+3. Подтверждение старшим таймфреймом.
+4. Объём и риск ложного входа.
+
+Не придумывай данные.
+Не меняй BUY на SELL и наоборот.
+При сомнениях выбирай REJECT или UNCERTAIN.
+
+Верни только JSON:
+{
+  "decision": "CONFIRM или REJECT или UNCERTAIN",
+  "confidence": 0,
+  "reason": "Объяснение на русском"
+}
+"""
+
+    try:
+        response = await ai_client.responses.create(
+            model=AI_MODEL,
+            instructions=instructions,
+            input=result["text"][:5000],
+            text={"format": {"type": "json_object"}},
+            max_output_tokens=250,
+        )
+
+        data = json.loads(response.output_text)
+        decision = str(data.get("decision", "")).upper()
+        confidence = int(data.get("confidence", 0))
+        confidence = max(0, min(100, confidence))
+        reason = str(data.get("reason", "Нет объяснения"))[:400]
+
+        if decision == "CONFIRM" and confidence >= 65:
+            result["signal"] = original
+            status = "ПОДТВЕРЖДЁН 🟢"
+        else:
+            result["signal"] = "WAIT 🟡"
+            status = "НЕ ПОДТВЕРЖДЁН 🟡"
+
+        result["text"] += (
+            f"\n\n🧠 SEIRAN AI\n"
+            f"Статус: {status}\n"
+            f"Оценка ИИ: {confidence}%\n"
+            f"Обоснование: {reason}"
+        )
+
+    except Exception:
+        log.exception("SEIRAN AI error")
+        result["signal"] = "WAIT 🟡"
+        result["text"] += "\n\n⚠️ SEIRAN AI недоступен. WAIT."
+
+    return result
+
 
 async def analyze_market(symbol, interval):
     if interval not in INTERVALS:
