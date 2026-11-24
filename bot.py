@@ -580,4 +580,4 @@ await update.message.reply_text(
         f"🟢 Онлайн-наблюдение включено\n"
         f"Пара: {product}\n"
         f"Таймфрейм: {interval}\n"
-    )
+        )
