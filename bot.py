@@ -704,4 +704,47 @@ def main():
 
 if __name__ == "__main__":
     main()
-    
+async def unwatch_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    job = watch_jobs.pop(chat_id, None)
+    if job:
+        job.schedule_removal()
+    await update.message.reply_text("⏹ Наблюдение остановлено.")
+
+
+async def scan_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("Сканирование будет подключено отдельно.")
+
+
+async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    await query.edit_message_text("Выбор принят. Используй /signal BTC-USD 5m")
+
+
+def main():
+    if not BOT_TOKEN:
+        raise RuntimeError("Не задан BOT_TOKEN в Render Environment")
+
+    application = Application.builder().token(BOT_TOKEN).build()
+
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("help", help_command))
+    application.add_handler(CommandHandler("menu", menu_command))
+    application.add_handler(CommandHandler("symbols", symbols_command))
+    application.add_handler(CommandHandler("price", price_command))
+    application.add_handler(CommandHandler("signal", signal_command))
+    application.add_handler(CommandHandler("watch", watch_command))
+    application.add_handler(CommandHandler("unwatch", unwatch_command))
+    application.add_handler(CommandHandler("scan", scan_command))
+    application.add_handler(CallbackQueryHandler(button_handler))
+
+    application.run_polling(
+        allowed_updates=Update.ALL_TYPES,
+        timeout=60,
+        bootstrap_retries=-1,
+    )
+
+
+if __name__ == "__main__":
+    main()      
