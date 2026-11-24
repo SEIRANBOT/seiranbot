@@ -876,5 +876,8 @@ async def scan_markets(
             else "🔴"
         )
 
+        
         lines.append(
-            f"{emoji} {item['name']} (
+            f"{emoji} {item['name']} "
+            f"({item['signal']})"
+        )
