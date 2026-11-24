@@ -574,6 +574,9 @@ async def watch_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
     
-    await update.message.reply_text(
-        f"🟢 Онлайн-наблюдение включено\nПара: {product}\nТаймфрейм: {interval}\n"
+        await update.message.reply_text(
+        f"🟢 Онлайн-наблюдение включено\n"
+        f"Пара: {product}\n"
+        f"Таймфрейм: {interval}\n"
+    )
    
