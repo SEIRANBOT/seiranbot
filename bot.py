@@ -572,11 +572,12 @@ async def watch_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     watch_jobs[chat_id] = job
 
-
-    
+await update.message.reply_text(
+    f"🟢 Онлайн-наблюдение включено\n"
+    f"Пара: {product}\n"
+)
         await update.message.reply_text(
         f"🟢 Онлайн-наблюдение включено\n"
         f"Пара: {product}\n"
         f"Таймфрейм: {interval}\n"
     )
-   
