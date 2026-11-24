@@ -1,11 +1,11 @@
+
 import os
-import json
-import math
 import asyncio
 import logging
 from datetime import datetime, timezone
 
-import aiohttp
+import pandas as pd
+import yfinance as yf
 from openai import AsyncOpenAI
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
@@ -15,569 +15,938 @@ from telegram.ext import (
     ContextTypes,
 )
 
-# SEIRANBOT FINAL — live market monitoring and multi-timeframe signals
-# Requirements: python-telegram-bot[job-queue]>=21,<23 ; aiohttp>=3.9
-# Render environment variable: BOT_TOKEN (keep the existing value)
+from aiohttp import web
+
+
+# ============================================================
+# SEIRANBOT — MARKET ANALYSIS
+# ============================================================
+
+BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4.1-mini").strip()
+
+POLL_SECONDS = int(os.getenv("POLL_SECONDS", "300"))
+SCAN_LIMIT = int(os.getenv("SCAN_LIMIT", "18"))
+MIN_CONFIDENCE = int(os.getenv("MIN_CONFIDENCE", "65"))
+
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 
 logging.basicConfig(
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    level=logging.INFO,
+    level=getattr(logging, LOG_LEVEL, logging.INFO),
+    format="%(asctime)s | %(levelname)s | %(message)s",
 )
-log = logging.getLogger("SEIRANBOT")
 
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-AI_MODEL = os.getenv("OPENAI_MODEL", "gpt-5.5")
+logger = logging.getLogger("SEIRANBOT")
 
 ai_client = (
-    AsyncOpenAI(api_key=OPENAI_API_KEY)
-    if OPENAI_API_KEY else None
+    AsyncOpenAI(api_key=OPENAI_API_KEY, timeout=25.0)
+    if OPENAI_API_KEY
+    else None
 )
-BASE_URL = "https://api.exchange.coinbase.com"
-DEFAULT_SYMBOL = "BTC-USD"
-DEFAULT_INTERVAL = "5m"
-POLL_SECONDS = 15
-HTTP_TIMEOUT = aiohttp.ClientTimeout(total=15)
+
+watch_jobs = {}
+last_signals = {}
+
+# Доступные инструменты Yahoo Finance.
+# Список можно расширять символами Yahoo Finance.
+
+MARKET_SYMBOLS = {
+    "EURUSD=X": "Forex EUR/USD",
+    "GBPUSD=X": "Forex GBP/USD",
+    "USDJPY=X": "Forex USD/JPY",
+    "AUDUSD=X": "Forex AUD/USD",
+    "USDCAD=X": "Forex USD/CAD",
+    "USDCHF=X": "Forex USD/CHF",
+
+    "BTC-USD": "Crypto Bitcoin",
+    "ETH-USD": "Crypto Ethereum",
+    "SOL-USD": "Crypto Solana",
+    "XRP-USD": "Crypto XRP",
+
+    "AAPL": "Apple",
+    "MSFT": "Microsoft",
+    "NVDA": "Nvidia",
+    "TSLA": "Tesla",
+    "AMZN": "Amazon",
+
+    "^GSPC": "S&P 500",
+    "^IXIC": "NASDAQ",
+    "^DJI": "Dow Jones",
+    "^FTSE": "FTSE 100",
+    "^GDAXI": "DAX",
+
+    "GC=F": "Gold",
+    "SI=F": "Silver",
+    "CL=F": "Crude Oil",
+    "BZ=F": "Brent Oil",
+    "NG=F": "Natural Gas",
+}
+
 
 INTERVALS = {
-    "1m": 60,
-    "5m": 300,
-    "15m": 900,
-    "1h": 3600,
-    "6h": 21600,
-    "1d": 86400,
+    "1m": ("1m", "1d"),
+    "5m": ("5m", "5d"),
+    "15m": ("15m", "5d"),
+    "30m": ("30m", "1mo"),
+    "1h": ("60m", "1mo"),
+    "4h": ("60m", "3mo"),
+    "1d": ("1d", "1y"),
 }
-HIGHER_TF = {
-    "1m": "5m",
-    "5m": "15m",
-    "15m": "1h",
-    "1h": "6h",
-    "6h": "1d",
-    "1d": "1d",
-}
-PRODUCT_CACHE_SECONDS = 300
-_products_cache = {}
-_products_cache_time = 0.0
-watch_jobs = {}
-last_watch_state = {}
 
 
-async def api_get(path, params=None):
-    headers = {"User-Agent": "SEIRANBOT/4.0", "Accept": "application/json"}
-    async with aiohttp.ClientSession(timeout=HTTP_TIMEOUT, headers=headers) as session:
-        async with session.get(BASE_URL + path, params=params) as response:
-            body = await response.text()
-            if response.status != 200:
-                raise RuntimeError(f"Биржа вернула HTTP {response.status}: {body[:180]}")
-            try:
-                return json.loads(body)
-            except json.JSONDecodeError as exc:
-                raise RuntimeError("Биржа вернула неправильный ответ") from exc
+def normalize_symbol(value: str) -> str:
+    return value.strip().upper()
 
 
-async def get_products(force=False):
-    global _products_cache, _products_cache_time
-    now = asyncio.get_running_loop().time()
-    if not force and _products_cache and now - _products_cache_time < PRODUCT_CACHE_SECONDS:
-        return dict(_products_cache)
-    data = await api_get("/products")
-    if not isinstance(data, list):
-        raise RuntimeError("Не удалось получить список торговых пар")
-    products = {}
-    for item in data:
-        if not isinstance(item, dict):
-            continue
-        if item.get("quote_currency") != "USD":
-            continue
-        if item.get("status") not in (None, "online") or item.get("trading_disabled") is True:
-            continue
-        product_id = item.get("id")
-        if product_id:
-            products[product_id] = product_id
-    if not products:
-        raise RuntimeError("Список активных USD-пар пуст")
-    _products_cache = dict(sorted(products.items()))
-    _products_cache_time = now
-    return dict(_products_cache)
+def get_symbol_name(symbol: str) -> str:
+    return MARKET_SYMBOLS.get(symbol, symbol)
 
 
-async def resolve_product(symbol):
-    symbol = (symbol or DEFAULT_SYMBOL).upper().strip().replace("/", "-")
-    products = await get_products()
-    candidates = [symbol]
-    if "-" not in symbol:
-        if symbol.endswith("USDT"):
-            base = symbol[:-4]
-        elif symbol.endswith("USD"):
-            base = symbol[:-3]
-        else:
-            base = symbol
-        candidates.append(base + "-USD")
-    for candidate in candidates:
-        if candidate in products:
-            return candidate
-    raise ValueError(f"Пара {symbol} не найдена на Coinbase USD. Команда /symbols покажет список.")
+def get_interval(value: str) -> str:
+    interval = value.strip().lower()
+    if interval not in INTERVALS:
+        raise ValueError(
+            "Неверный таймфрейм. Используй: "
+            "1m, 5m, 15m, 30m, 1h, 4h или 1d."
+        )
+    return interval
 
 
-async def get_ticker(product_id):
-    data = await api_get(f"/products/{product_id}/ticker")
-    return float(data["price"]), data.get("time")
+def download_market_data(symbol: str, interval: str) -> pd.DataFrame:
+    yahoo_interval, period = INTERVALS[interval]
 
-
-async def get_candles(product_id, interval):
-    raw = await api_get(
-        f"/products/{product_id}/candles",
-        {"granularity": INTERVALS[interval]},
+    ticker = yf.Ticker(symbol)
+    data = ticker.history(
+        period=period,
+        interval=yahoo_interval,
+        auto_adjust=True,
+        actions=False,
     )
-    if not isinstance(raw, list):
-        raise RuntimeError("Биржа не вернула свечи")
-    candles = sorted(
-        [row for row in raw if isinstance(row, list) and len(row) >= 6],
-        key=lambda row: int(row[0]),
-    )
-    # Remove the currently-forming candle; use only completed candles for indicators.
-    if len(candles) > 1:
-        candles = candles[:-1]
-    if len(candles) < 60:
-        raise RuntimeError(f"Мало исторических свечей для {interval}: {len(candles)}")
-    return candles
+
+    if data is None or data.empty:
+        raise ValueError(
+            f"Нет доступных котировок для {symbol}."
+        )
+
+    data = data.dropna(subset=["Close"]).copy()
+
+    if interval == "4h":
+        data = data.resample("4h").agg({
+            "Open": "first",
+            "High": "max",
+            "Low": "min",
+            "Close": "last",
+            "Volume": "sum",
+        }).dropna(subset=["Close"])
+
+    if len(data) < 40:
+        raise ValueError(
+            f"Недостаточно свечей для анализа {symbol}."
+        )
+
+    return data
 
 
-def ema(values, period):
-    if len(values) < period:
-        raise ValueError("Недостаточно свечей для EMA")
-    alpha = 2.0 / (period + 1.0)
-    result = sum(values[:period]) / period
-    for value in values[period:]:
-        result = alpha * value + (1.0 - alpha) * result
-    return result
+def calculate_indicators(data: pd.DataFrame) -> dict:
+    close = data["Close"].astype(float)
+    high = data["High"].astype(float)
+    low = data["Low"].astype(float)
 
+    ema9 = close.ewm(span=9, adjust=False).mean()
+    ema21 = close.ewm(span=21, adjust=False).mean()
+    ema50 = close.ewm(span=50, adjust=False).mean()
 
-def rsi(values, period=14):
-    if len(values) <= period:
-        raise ValueError("Недостаточно данных для RSI")
-    changes = [values[i] - values[i - 1] for i in range(1, len(values))]
-    gains = [max(x, 0.0) for x in changes]
-    losses = [max(-x, 0.0) for x in changes]
-    avg_gain = sum(gains[:period]) / period
-    avg_loss = sum(losses[:period]) / period
-    for i in range(period, len(gains)):
-        avg_gain = (avg_gain * (period - 1) + gains[i]) / period
-        avg_loss = (avg_loss * (period - 1) + losses[i]) / period
-    if avg_loss == 0:
-        return 100.0 if avg_gain > 0 else 50.0
-    rs = avg_gain / avg_loss
-    return 100.0 - (100.0 / (1.0 + rs))
+    delta = close.diff()
 
+    gains = delta.clip(lower=0)
+    losses = -delta.clip(upper=0)
 
-def atr(candles, period=14):
-    if len(candles) < period + 1:
-        raise ValueError("Недостаточно данных для ATR")
-    ranges = []
-    for i in range(1, len(candles)):
-        low = float(candles[i][1])
-        high = float(candles[i][2])
-        prev_close = float(candles[i - 1][4])
-        ranges.append(max(high - low, abs(high - prev_close), abs(low - prev_close)))
-    return sum(ranges[-period:]) / period
+    avg_gain = gains.ewm(
+        alpha=1 / 14,
+        min_periods=14,
+        adjust=False,
+    ).mean()
 
+    avg_loss = losses.ewm(
+        alpha=1 / 14,
+        min_periods=14,
+        adjust=False,
+    ).mean()
 
-def macd_histogram(values):
-    if len(values) < 40:
-        raise ValueError("Недостаточно данных для MACD")
-    fast = ema(values, 12)  
-    slow = ema(values, 26)
-    macd_line = fast - slow
-    # Signal-line approximation is calculated from the MACD series.
-    macd_series = []
-    for end in range(26, len(values) + 1):
-        macd_series.append(ema(values[:end], 12) - ema(values[:end], 26))
-    signal_line = ema(macd_series, 9)
-    return macd_line - signal_line
+    rs = avg_gain / avg_loss.replace(0, float("nan"))
+    rsi = 100 - (100 / (1 + rs))
 
+    ema12 = close.ewm(span=12, adjust=False).mean()
+    ema26 = close.ewm(span=26, adjust=False).mean()
 
-def volume_confirmation(candles):
-    volumes = [float(c[5]) for c in candles]
-    if len(volumes) < 21:
-        return False, 0.0
-    average = sum(volumes[-21:-1]) / 20.0
-    ratio = volumes[-1] / average if average > 0 else 0.0
-    return ratio >= 1.05, ratio
+    macd = ema12 - ema26
+    macd_signal = macd.ewm(span=9, adjust=False).mean()
 
+    previous_close = close.shift(1)
 
-def timeframe_metrics(candles):
-    closes = [float(c[4]) for c in candles]
-    last = closes[-1]
-    e20 = ema(closes, 20)
-    e50 = ema(closes, 50)
-    r = rsi(closes)
-    m = macd_histogram(closes)
-    volume_ok, volume_ratio = volume_confirmation(candles)
-    direction = 1 if e20 > e50 and last > e20 else (-1 if e20 < e50 and last < e20 else 0)
+    true_range = pd.concat(
+        [
+            high - low,
+            (high - previous_close).abs(),
+            (low - previous_close).abs(),
+        ],
+        axis=1,
+    ).max(axis=1)
+
+    atr = true_range.ewm(
+        alpha=1 / 14,
+        adjust=False,
+    ).mean()
+
+    current_price = float(close.iloc[-1])
+    current_rsi = float(rsi.iloc[-1])
+    current_atr = float(atr.iloc[-1])
+
+    if pd.isna(current_rsi) or pd.isna(current_atr):
+        raise ValueError("Не удалось рассчитать индикаторы.")
+
     return {
-        "close": last,
-        "ema20": e20,
-        "ema50": e50,
-        "rsi": r,
-        "macd_hist": m,
-        "direction": direction,
-        "volume_ok": volume_ok,
-        "volume_ratio": volume_ratio,
-        "atr": atr(candles),
-        "candle_time": int(candles[-1][0]),
+        "price": current_price,
+        "ema9": float(ema9.iloc[-1]),
+        "ema21": float(ema21.iloc[-1]),
+        "ema50": float(ema50.iloc[-1]),
+        "rsi": current_rsi,
+        "macd": float(macd.iloc[-1]),
+        "macd_signal": float(macd_signal.iloc[-1]),
+        "atr": current_atr,
+        "volume": float(data["Volume"].iloc[-1]),
+        "previous_price": float(close.iloc[-2]),
     }
 
 
-def build_signal(symbol, interval, price, main, higher, ticker_time):
+def technical_analysis(indicators: dict) -> dict:
     score = 0
     reasons = []
-    direction = main["direction"]
-    if direction:
-        score += direction * 2
-        reasons.append("Тренд EMA и положение цены подтверждают направление")
-    else:
-        reasons.append("Основной тренд пока не определён")
 
-    if main["macd_hist"] > 0:
+    price = indicators["price"]
+    ema9 = indicators["ema9"]
+    ema21 = indicators["ema21"]
+    ema50 = indicators["ema50"]
+    rsi = indicators["rsi"]
+    macd = indicators["macd"]
+    macd_signal = indicators["macd_signal"]
+
+    if ema9 > ema21:
         score += 1
-        reasons.append("Импульс MACD положительный")
-    elif main["macd_hist"] < 0:
-        score -= 1
-        reasons.append("Импульс MACD отрицательный")
+        reasons.append("EMA 9 выше EMA 21")
 
-    if 52 <= main["rsi"] <= 68:
+    elif ema9 < ema21:
+        score -= 1
+        reasons.append("EMA 9 ниже EMA 21")
+
+    if price > ema50:
         score += 1
-        reasons.append("RSI поддерживает рост без сильной перекупленности")
-    elif 32 <= main["rsi"] <= 48:
+        reasons.append("Цена выше EMA 50")
+
+    elif price < ema50:
         score -= 1
-        reasons.append("RSI поддерживает снижение без сильной перепроданности")
-    elif main["rsi"] > 72:
-        reasons.append("RSI высокий: вход в покупку рискован")
-    elif main["rsi"] < 28:
-        reasons.append("RSI низкий: вход в продажу рискован")
+        reasons.append("Цена ниже EMA 50")
 
-    higher_direction = higher["direction"]
-    if higher_direction == direction and direction != 0:
-        score += direction
-        reasons.append("Старший таймфрейм подтверждает направление")
+    if macd > macd_signal:
+        score += 1
+        reasons.append("MACD бычий")
+
+    elif macd < macd_signal:
+        score -= 1
+        reasons.append("MACD медвежий")
+
+    if 50 < rsi < 70:
+        score += 1
+        reasons.append("RSI поддерживает рост")
+
+    elif 30 < rsi < 50:
+        score -= 1
+        reasons.append("RSI поддерживает снижение")
+
+    elif rsi >= 70:
+        reasons.append("RSI: зона перекупленности")
+
+    elif rsi <= 30:
+        reasons.append("RSI: зона перепроданности")
+
+    if score >= 3:
+        signal = "BUY"
+    elif score <= -3:
+        signal = "SELL"
     else:
-        reasons.append("Старший таймфрейм не подтверждает направление")
+        signal = "WAIT"
 
-    if main["volume_ok"]:
-        score += 1 if direction > 0 else (-1 if direction < 0 else 0)
-        reasons.append(f"Объём выше среднего ({main['volume_ratio']:.2f}x)")
-    else:
-        reasons.append(f"Объём не усиливает движение ({main['volume_ratio']:.2f}x)")
+    confidence = min(90, 50 + abs(score) * 10)
 
-    # Require trend + momentum + higher-timeframe agreement; otherwise WAIT.
-    if score >= 4 and direction == 1 and higher_direction == 1 and main["rsi"] < 72:
-        signal = "BUY 🟢"
-        stop = price - 1.5 * main["atr"]
-        target = price + 2.5 * main["atr"]
-    elif score <= -4 and direction == -1 and higher_direction == -1 and main["rsi"] > 28:
-        signal = "SELL 🔴"
-        stop = price + 1.5 * main["atr"]
-        target = price - 2.5 * main["atr"]
-    else:
-        signal = "WAIT 🟡"
-        stop = target = None
-
-    now_text = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
-    quote_time = ticker_time or "время биржи не указано"
-    stop_text = "—"
-    target_text = "—"
-    if stop is not None:
-        stop_text = f"{stop:.8g} USD"
-        target_text = f"{target:.8g} USD"
-
-    reasons_text = "\n".join("• " + x for x in reasons)
-    strength = min(100, round(abs(score) / 6 * 100))
     return {
         "signal": signal,
         "score": score,
-        "price": price,
-        "candle_time": main["candle_time"],
-        "text": (
-            f"🤖 SEIRANBOT — LIVE SIGNAL\n\n"
-            f"Рынок: Coinbase Spot ({symbol})\n"
-            f"Текущая цена: {price:.8g} USD\n"
-            f"Таймфрейм входа: {interval}\n"
-            f"Подтверждение: {HIGHER_TF[interval]}\n"
-            f"Сигнал: {signal}\n"
-            f"Оценка совпадения условий: {strength}% (не вероятность прибыли)\n\n"
-            f"RSI: {main['rsi']:.1f}\n"
-            f"MACD histogram: {main['macd_hist']:.8g}\n"
-            f"EMA 20: {main['ema20']:.8g}\n"
-            f"EMA 50: {main['ema50']:.8g}\n"
-            f"Объём / средний: {main['volume_ratio']:.2f}x\n"
-            f"Старший тренд: {'ВВЕРХ' if higher_direction == 1 else 'ВНИЗ' if higher_direction == -1 else 'НЕЙТРАЛЬНЫЙ'}\n\n"
-            f"Причины:\n{reasons_text}\n\n"
-            f"Расчётный Stop Loss: {stop_text}\n"
-            f"Расчётный Take Profit: {target_text}\n"
-            f"Время сигнала: {now_text}\n"
-            f"Время котировки биржи: {quote_time}\n\n"
-            f"Обновление наблюдения: примерно каждые {POLL_SECONDS} сек.\n"
-            f"Важно: это аналитический сигнал, не гарантия результата и не команда на автоматическую сделку. "
-            f"Coinbase USD может отличаться от котировок Pocket Option/OTC. Сначала проверяй на демо."
-        ),
+        "confidence": confidence,
+        "reasons": reasons,
     }
 
-async def ai_review_signal(result):
-    original = result["signal"]
 
-    if original not in ("BUY 🟢", "SELL 🔴"):
-        result["ai_review"] = "Технический сигнал отсутствует."
-        return result
+async def analyze_timeframe(
+    symbol: str,
+    interval: str,
+) -> dict:
+    data = await asyncio.to_thread(
+        download_market_data,
+        symbol,
+        interval,
+    )
 
+    indicators = calculate_indicators(data)
+    technical = technical_analysis(indicators)
+
+    return {
+        "symbol": symbol,
+        "name": get_symbol_name(symbol),
+        "interval": interval,
+        "indicators": indicators,
+        "technical": technical,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    }
+
+# ============================================================
+# AI ANALYSIS
+# ============================================================
+
+async def ai_review(result: dict) -> str:
     if ai_client is None:
-        result["signal"] = "WAIT 🟡"
-        result["ai_review"] = "OpenAI API не подключён."
-        return result
+        return "AI-фильтр не подключён: добавь OPENAI_API_KEY в Render."
 
-    instructions = """
-Ты SEIRAN AI — независимый фильтр технических сигналов.
+    technical = result["technical"]
+    indicators = result["indicators"]
 
-Проверь:
-1. Согласованность EMA и направления тренда.
-2. RSI и MACD.
-3. Подтверждение старшим таймфреймом.
-4. Объём и риск ложного входа.
+    prompt = f"""
+Ты аналитический фильтр торгового сигнала SEIRANBOT.
 
-Не придумывай данные.
-Не меняй BUY на SELL и наоборот.
-При сомнениях выбирай REJECT или UNCERTAIN.
+Инструмент: {result['name']} ({result['symbol']})
+Таймфрейм: {result['interval']}
+Технический сигнал: {technical['signal']}
+Технический балл: {technical['score']}
+Цена: {indicators['price']}
+RSI: {indicators['rsi']:.2f}
+EMA 9: {indicators['ema9']}
+EMA 21: {indicators['ema21']}
+EMA 50: {indicators['ema50']}
+MACD: {indicators['macd']}
+MACD signal: {indicators['macd_signal']}
+ATR: {indicators['atr']}
+Причины: {', '.join(technical['reasons'])}
 
-Верни только JSON:
-{
-  "decision": "CONFIRM или REJECT или UNCERTAIN",
-  "confidence": 0,
-  "reason": "Объяснение на русском"
-}
+Оцени согласованность технических условий.
+Не выдумывай котировки, новости или события.
+Не обещай прибыль.
+Не меняй технический сигнал на противоположный.
+Ответь по-русски кратко: подтверждение или сомнение и почему.
 """
 
     try:
-        response = await ai_client.responses.create(
-            model=AI_MODEL,
-            instructions=instructions,
-            input=result["text"][:5000],
-            text={"format": {"type": "json_object"}},
-            max_output_tokens=250,
+        response = await ai_client.chat.completions.create(
+            model=OPENAI_MODEL,
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "Ты осторожный аналитический помощник. "
+                        "Не выдавай прогноз за гарантию."
+                    ),
+                },
+                {"role": "user", "content": prompt},
+            ],
+            temperature=0.2,
+            max_tokens=180,
         )
 
-        data = json.loads(response.output_text)
-        decision = str(data.get("decision", "")).upper()
-        confidence = int(data.get("confidence", 0))
-        confidence = max(0, min(100, confidence))
-        reason = str(data.get("reason", "Нет объяснения"))[:400]
+        answer = response.choices[0].message.content
+        return answer.strip() if answer else "AI не дал заключение."
 
-        if decision == "CONFIRM" and confidence >= 65:
-            result["signal"] = original
-            status = "ПОДТВЕРЖДЁН 🟢"
-        else:
-            result["signal"] = "WAIT 🟡"
-            status = "НЕ ПОДТВЕРЖДЁН 🟡"
+    except Exception:
+        logger.exception("Ошибка AI")
+        return "AI временно недоступен. Используется технический анализ."
 
-        result["text"] += (
-            f"\n\n🧠 SEIRAN AI\n"
-            f"Статус: {status}\n"
-            f"Оценка ИИ: {confidence}%\n"
-            f"Обоснование: {reason}"
+
+# ============================================================
+# SIGNAL MESSAGE
+# ============================================================
+
+async def build_signal_message(
+    symbol: str,
+    interval: str,
+) -> str:
+    result = await analyze_timeframe(symbol, interval)
+
+    technical = result["technical"]
+    indicators = result["indicators"]
+
+    signal = technical["signal"]
+    confidence = technical["confidence"]
+
+    if signal != "WAIT" and confidence >= MIN_CONFIDENCE:
+        ai_text = await ai_review(result)
+    else:
+        ai_text = "AI-фильтр не запускался: технические условия недостаточно сильные."
+
+    reasons = "\n".join(
+        f"• {reason}"
+        for reason in technical["reasons"]
+    )
+
+    if not reasons:
+        reasons = "• Нет сильного совпадения индикаторов"
+
+    emoji = {
+        "BUY": "🟢",
+        "SELL": "🔴",
+        "WAIT": "🟡",
+    }.get(signal, "⚪")
+
+    return (
+        f"🤖 SEIRANBOT — АНАЛИЗ РЫНКА\n\n"
+        f"Инструмент: {result['name']}\n"
+        f"Символ: {symbol}\n"
+        f"Таймфрейм: {interval}\n"
+        f"Цена: {indicators['price']:.6f}\n\n"
+        f"{emoji} СИГНАЛ: {signal}\n"
+        f"Оценка совпадения условий: {confidence}%\n"
+        f"Технический балл: {technical['score']}\n\n"
+        f"📊 ИНДИКАТОРЫ\n"
+        f"RSI: {indicators['rsi']:.2f}\n"
+        f"EMA 9: {indicators['ema9']:.6f}\n"
+        f"EMA 21: {indicators['ema21']:.6f}\n"
+        f"EMA 50: {indicators['ema50']:.6f}\n"
+        f"MACD: {indicators['macd']:.6f}\n"
+        f"ATR: {indicators['atr']:.6f}\n\n"
+        f"📌 ПРИЧИНЫ\n{reasons}\n\n"
+        f"🧠 AI-ФИЛЬТР\n{ai_text}\n\n"
+        f"🕒 Время UTC: "
+        f"{datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')}\n\n"
+        f"⚠️ Это аналитический сигнал, а не гарантия прибыли. "
+        f"Котировки внешнего источника могут отличаться от Pocket Option OTC. "
+        f"Сделки бот не открывает."
+    )
+
+
+# ============================================================
+# TELEGRAM COMMANDS
+# ============================================================
+
+def main_keyboard():
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("📊 Сигнал", callback_data="signal"),
+            InlineKeyboardButton("🔎 Сканирование", callback_data="scan"),
+        ],
+        [
+            InlineKeyboardButton("📈 Рынки", callback_data="symbols"),
+            InlineKeyboardButton("ℹ️ Помощь", callback_data="help"),
+        ],
+    ])
+
+
+async def start_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+    text = (
+        "🤖 SEIRANBOT запущен.\n\n"
+        "Я анализирую доступные рыночные инструменты "
+        "и отправляю сигналы BUY / SELL / WAIT.\n\n"
+        "Сделки открываешь вручную.\n"
+        "Выбери действие:"
+    )
+
+    await update.message.reply_text(
+        text,
+        reply_markup=main_keyboard(),
+    )
+
+
+async def help_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+    text = (
+        "📚 КОМАНДЫ SEIRANBOT\n\n"
+        "/start — главное меню\n"
+        "/help — помощь\n"
+        "/symbols — список инструментов\n"
+        "/signal EURUSD=X 5m — анализ инструмента\n"
+        "/price BTC-USD — текущая доступная цена\n"
+        "/scan — сканирование списка рынков\n"
+        "/watch EURUSD=X 5m — наблюдение\n"
+        "/unwatch — остановить наблюдение\n\n"
+        "Таймфреймы: 1m, 5m, 15m, 30m, 1h, 4h, 1d.\n\n"
+        "Примеры:\n"
+        "/signal BTC-USD 15m\n"
+        "/signal GC=F 1h\n"
+        "/watch EURUSD=X 5m"
+    )
+
+    await update.message.reply_text(text)
+
+
+async def symbols_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+    lines = ["📈 ДОСТУПНЫЕ ИНСТРУМЕНТЫ\n"]
+
+    for symbol, name in MARKET_SYMBOLS.items():
+        lines.append(f"{symbol} — {name}")
+
+    await update.message.reply_text(
+        "\n".join(lines),
+    )
+
+
+async def signal_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+    if not context.args:
+        await update.message.reply_text(
+            "Укажи инструмент.\n"
+            "Пример: /signal EURUSD=X 5m"
+        )
+        return
+
+    symbol = normalize_symbol(context.args[0])
+    interval = "5m"
+
+    if len(context.args) > 1:
+        try:
+            interval = get_interval(context.args[1])
+        except ValueError as error:
+            await update.message.reply_text(str(error))
+            return
+
+    await update.message.reply_text(
+        f"⏳ Анализирую {symbol}..."
+    )
+
+    try:
+        message = await build_signal_message(symbol, interval)
+        await update.message.reply_text(message)
+
+    except Exception as error:
+        logger.exception("Ошибка анализа %s", symbol)
+        await update.message.reply_text(
+            f"Не удалось выполнить анализ {symbol}.\n"
+            f"Причина: {str(error)[:300]}"
+        )
+
+
+async def price_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+    if not context.args:
+        await update.message.reply_text(
+            "Пример: /price BTC-USD"
+        )
+        return
+
+    symbol = normalize_symbol(context.args[0])
+
+    try:
+        data = await asyncio.to_thread(
+            download_market_data,
+            symbol,
+            "5m",
+        )
+
+        price = float(data["Close"].iloc[-1])
+
+        await update.message.reply_text(
+            f"📊 {get_symbol_name(symbol)}\n"
+            f"Символ: {symbol}\n"
+            f"Последняя доступная цена: {price:.8f}\n"
+            f"Источник: Yahoo Finance"
+        )
+
+    except Exception as error:
+        logger.exception("Ошибка получения цены")
+        await update.message.reply_text(
+            f"Не удалось получить цену: {str(error)[:250]}"
+        )
+
+
+# ============================================================
+# MARKET SCANNER
+# ============================================================
+
+async def scan_markets(
+    chat_id: int,
+    application: Application,
+):
+    await application.bot.send_message(
+        chat_id=chat_id,
+        text="🔎 SEIRANBOT начал сканирование рынков...",
+    )
+
+    found = []
+
+    symbols = list(MARKET_SYMBOLS.items())[:SCAN_LIMIT]
+
+    for symbol, name in symbols:
+        try:
+            result = await analyze_timeframe(symbol, "15m")
+            technical = result["technical"]
+
+            if (
+                technical["signal"] != "WAIT"
+                and technical["confidence"] >= MIN_CONFIDENCE
+            ):
+                found.append(
+                    (
+                        symbol,
+                        name,
+                        technical["signal"],
+                        technical["confidence"],
+                    )
+                )
+
+        except Exception as error:
+            logger.warning(
+                "Сканирование %s пропущено: %s",
+                symbol,
+                error,
+            )
+
+        await asyncio.sleep(0.4)
+
+    if not found:
+        await application.bot.send_message(
+            chat_id=chat_id,
+            text=(
+                "🟡 Сильных сигналов сейчас не найдено.\n"
+                "Лучше дождаться более ясных условий."
+            ),
+        )
+        return
+
+    lines = ["📊 РЕЗУЛЬТАТ СКАНИРОВАНИЯ\n"]
+
+    for symbol, name, signal, confidence in found:
+        emoji = "🟢" if signal == "BUY" else "🔴"
+        lines.append(
+            f"{emoji} {name} ({symbol}) — "
+            f"{signal}, оценка условий {confidence}%"
+        )
+
+    lines.append(
+        "\nДля подробного анализа используй:\n"
+        "/signal СИМВОЛ 15m"
+    )
+
+    await application.bot.send_message(
+        chat_id=chat_id,
+        text="\n".join(lines),
+    )
+
+
+async def scan_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+    await scan_markets(
+        update.effective_chat.id,
+        context.application,
+    )
+
+
+# ============================================================
+# AUTOMATIC WATCH
+# ============================================================
+
+async def watch_job(context: ContextTypes.DEFAULT_TYPE):
+    data = context.job.data
+
+    chat_id = context.job.chat_id
+    symbol = data["symbol"]
+    interval = data["interval"]
+
+    try:
+        result = await analyze_timeframe(symbol, interval)
+
+        technical = result["technical"]
+        signal = technical["signal"]
+
+        key = f"{chat_id}:{symbol}:{interval}"
+        previous = last_signals.get(key)
+
+        if signal == "WAIT":
+            return
+
+        if previous == signal:
+            return
+
+        last_signals[key] = signal
+
+        message = await build_signal_message(
+            symbol,
+            interval,
+        )
+
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=message,
         )
 
     except Exception:
-        log.exception("SEIRAN AI error")
-        result["signal"] = "WAIT 🟡"
-        result["text"] += "\n\n⚠️ SEIRAN AI недоступен. WAIT."
-
-    return result
-
-
-async def analyze_market(symbol, interval):
-    if interval not in INTERVALS:
-        raise ValueError("Таймфрейм должен быть: " + ", ".join(INTERVALS))
-    product_id = await resolve_product(symbol)
-    higher_interval = HIGHER_TF[interval]
-    # Fetch two timeframes and the live ticker concurrently.
-    main_candles, higher_candles, ticker = await asyncio.gather(
-        get_candles(product_id, interval),
-        get_candles(product_id, higher_interval),
-        get_ticker(product_id),
-    )
-    main = timeframe_metrics(main_candles)
-    higher = timeframe_metrics(higher_candles) 
-    price, ticker_time = ticker
-    result = build_signal(product_id, interval, price, main, higher, ticker_time)
-    return await ai_review_signal(result)
-
-
-def timeframe_keyboard(symbol):
-    rows = []
-    names = list(INTERVALS)
-    for i in range(0, len(names), 3):
-        rows.append([
-            InlineKeyboardButton(name, callback_data=f"sig:{symbol}:{name}")
-            for name in names[i:i + 3]
-        ])
-    return InlineKeyboardMarkup(rows)
-
-
-def pairs_keyboard(products, page=0):
-    symbols = list(products)
-    page_size = 18
-    start = page * page_size
-    current = symbols[start:start + page_size]
-    rows = []
-    for i in range(0, len(current), 3):
-        rows.append([
-            InlineKeyboardButton(s, callback_data=f"pair:{s}")
-            for s in current[i:i + 3]
-        ])
-    nav = []
-    if page > 0:
-        nav.append(InlineKeyboardButton("⬅️", callback_data=f"page:{page - 1}"))
-    if start + page_size < len(symbols):
-        nav.append(InlineKeyboardButton("➡️", callback_data=f"page:{page + 1}"))
-    if nav:
-        rows.append(nav)
-    return InlineKeyboardMarkup(rows)
-
-
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    message = (
-        "Привет! Я SEIRANBOT 🤖\n\n"
-        "Получаю онлайн-котировки Coinbase и формирую сигналы BUY / SELL / WAIT.\n\n"
-        "Команды:\n"
-        "/menu — выбрать пару и таймфрейм\n"
-        "/symbols — список доступных пар\n"
-        "/price BTC-USD — текущая цена\n"
-        "/signal BTC-USD 1m — получить сигнал\n"
-        "/watch BTC-USD 1m — включить онлайн-наблюдение\n"
-        "/unwatch — выключить наблюдение\n"
-        "/scan 5m — сканировать пары (может занять время)\n"
-        "/help — помощь\n\n"
-        "Таймфреймы: 1m, 5m, 15m, 1h, 6h, 1d.\n"
-        f"Наблюдение обновляется примерно раз в {POLL_SECONDS} секунд."
-    )
-    await update.message.reply_text(message)
-    await menu_command(update, context)
-
-
-async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await start(update, context)
-
-
-async def menu_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    try:
-        products = await get_products()
-        await update.message.reply_text(
-            f"Выбери торговую пару Coinbase USD ({len(products)} рынков):",
-            reply_markup=pairs_keyboard(products),
+        logger.exception(
+            "Ошибка автоматического наблюдения %s",
+            symbol,
         )
-    except Exception as exc:
-        log.exception("Menu error")
-        await update.message.reply_text(f"Не удалось загрузить пары: {exc}")
 
 
-async def symbols_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    try:
-        products = await get_products(force=True)
-        text = "Доступные рынки Coinbase USD:\n" + "\n".join(products)
-        for offset in range(0, len(text), 3500):
-            await update.message.reply_text(text[offset:offset + 3500])
-    except Exception as exc:
-        log.exception("Symbols error")
-        await update.message.reply_text(f"Ошибка списка пар: {exc}")
-
-
-async def price_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    symbol = context.args[0] if context.args else DEFAULT_SYMBOL
-    try:
-        product = await resolve_product(symbol)
-        price, stamp = await get_ticker(product)
+async def watch_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+    if not context.args:
         await update.message.reply_text(
-            f"{product}\nЦена: {price:.8g} USD\nВремя биржи: {stamp or 'не указано'}"
-        )
-    except Exception as exc:
-        log.exception("Price error")
-        await update.message.reply_text(f"Ошибка цены: {exc}")
-
-
-async def signal_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    symbol = context.args[0] if context.args else DEFAULT_SYMBOL
-    interval = context.args[1].lower() if len(context.args) > 1 else DEFAULT_INTERVAL
-    status = await update.message.reply_text("⏳ Получаю котировку и проверяю два таймфрейма...")
-    try:
-        result = await analyze_market(symbol, interval)
-        await status.edit_text(result["text"])
-    except Exception as exc:
-        log.exception("Signal error")
-        await status.edit_text(f"Не удалось сформировать сигнал: {exc}")
-
-
-async def watch_job(context: ContextTypes.DEFAULT_TYPE):
-    job = context.job
-    chat_id = job.chat_id
-    symbol = job.data["symbol"]
-    interval = job.data["interval"]
-    key = (chat_id, symbol, interval)
-    try:
-        result = await analyze_market(symbol, interval)
-        current = result["signal"]
-        previous = last_watch_state.get(key)
-        # Notify on a new BUY/SELL state only; avoid flooding repeated alerts.
-        if current in ("BUY 🟢", "SELL 🔴") and current != previous:
-            await context.bot.send_message(
-                chat_id=chat_id,
-                text="🔔 НОВЫЙ LIVE-СИГНАЛ\n\n" + result["text"],
-            )
-        last_watch_state[key] = current
-    except Exception as exc:
-        log.warning("Watch error %s %s: %s", symbol, interval, exc)
-
-
-async def watch_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if context.job_queue is None:
-        await update.message.reply_text(
-            "Не установлен JobQueue. Проверь requirements.txt: нужна зависимость python-telegram-bot[job-queue]."
+            "Пример: /watch EURUSD=X 5m"
         )
         return
-    symbol = context.args[0] if context.args else DEFAULT_SYMBOL
-    interval = context.args[1].lower() if len(context.args) > 1 else DEFAULT_INTERVAL
-    try:
-        product = await resolve_product(symbol)
-        if interval not in INTERVALS:
-            raise ValueError("Таймфреймы: " + ", ".join(INTERVALS))
-        await analyze_market(product, interval)  # Validate data before enabling the job.
-    except Exception as exc:
-        await update.message.reply_text(f"Нельзя включить наблюдение: {exc}")
+
+    if context.job_queue is None:
+        await update.message.reply_text(
+            "Ошибка: JobQueue не подключён. "
+            "Проверь requirements.txt."
+        )
         return
 
     chat_id = update.effective_chat.id
-    old_job = watch_jobs.pop(chat_id, None)
-    
+    symbol = normalize_symbol(context.args[0])
+
+    interval = "5m"
+
+    if len(context.args) > 1:
+        try:
+            interval = get_interval(context.args[1])
+        except ValueError as error:
+            await update.message.reply_text(str(error))
+            return
+
+    old_job = watch_jobs.get(chat_id)
+
     if old_job:
         old_job.schedule_removal()
-
-    for key in list(last_watch_state):
-        if key[0] == chat_id:
-            last_watch_state.pop(key, None)
 
     job = context.job_queue.run_repeating(
         watch_job,
         interval=POLL_SECONDS,
-        first=1,
+        first=10,
         chat_id=chat_id,
-        name=f"live-watch-{chat_id}",
-        data={"symbol": product, "interval": interval},
+        name=f"seiran-watch-{chat_id}",
+        data={
+            "symbol": symbol,
+            "interval": interval,
+        },
     )
+
     watch_jobs[chat_id] = job
 
-await update.message.reply_text(
-    f"🟢 Онлайн-наблюдение включено\n"
-    f"Пара: {product}\n"
-)
-        await update.message.reply_text(
-        f"🟢 Онлайн-наблюдение включено\n"
-        f"Пара: {product}\n"
+    await update.message.reply_text(
+        f"🟢 Наблюдение включено.\n"
+        f"Инструмент: {symbol}\n"
         f"Таймфрейм: {interval}\n"
+        f"Проверка каждые {POLL_SECONDS} секунд.\n"
+        f"Остановка: /unwatch"
+    )
+
+
+async def unwatch_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+    chat_id = update.effective_chat.id
+    job = watch_jobs.pop(chat_id, None)
+
+    if job:
+        job.schedule_removal()
+
+        await update.message.reply_text(
+            "🔴 Автоматическое наблюдение остановлено."
         )
+    else:
+        await update.message.reply_text(
+            "Сейчас наблюдение не включено."
+        )
+
+
+# ============================================================
+# BUTTON HANDLER
+# ============================================================
+
+async def button_handler(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+    query = update.callback_query
+    await query.answer()
+
+    if query.data == "help":
+        await query.message.reply_text(
+            "Используй /help для списка команд."
+        )
+
+    elif query.data == "symbols":
+        lines = [
+            f"{symbol} — {name}"
+            for symbol, name in MARKET_SYMBOLS.items()
+        ]
+
+        await query.message.reply_text(
+            "📈 Инструменты:\n\n" + "\n".join(lines)
+        )
+
+    elif query.data == "scan":
+        await scan_markets(
+            query.message.chat_id,
+            context.application,
+        )
+
+    elif query.data == "signal":
+        await query.message.reply_text(
+            "Напиши команду:\n"
+            "/signal EURUSD=X 5m\n\n"
+            "Или выбери другой инструмент из /symbols."
+        )
+
+
+# ============================================================
+# HEALTH CHECK FOR RENDER
+# ============================================================
+
+async def health(request):
+    return web.json_response({
+        "status": "online",
+        "service": "SEIRANBOT",
+        "time": datetime.now(timezone.utc).isoformat(),
+    })
+
+
+async def start_web_server():
+    app = web.Application()
+    app.router.add_get("/", health)
+    app.router.add_get("/health", health)
+
+    runner = web.AppRunner(app)
+    await runner.setup()
+
+    port = int(os.getenv("PORT", "10000"))
+
+    site = web.TCPSite(
+        runner,
+        host="0.0.0.0",
+        port=port,
+    )
+
+    await site.start()
+
+    logger.info(
+        "Health server started on port %s",
+        port,
+    )
+
+    return runner
+
+
+# ============================================================
+# MAIN
+# ============================================================
+
+async def main():
+    if not BOT_TOKEN:
+        raise RuntimeError(
+            "Не задан BOT_TOKEN в переменных окружения Render."
+        )
+
+    if not OPENAI_API_KEY:
+        logger.warning(
+            "OPENAI_API_KEY не задан. "
+            "Бот будет работать без AI-фильтра."
+        )
+
+    application = (
+        Application.builder()
+        .token(BOT_TOKEN)
+        .build()
+    )
+
+    application.add_handler(
+        CommandHandler("start", start_command)
+    )
+    application.add_handler(
+        CommandHandler("help", help_command)
+    )
+    application.add_handler(
+        CommandHandler("symbols", symbols_command)
+    )
+    application.add_handler(
+        CommandHandler("signal", signal_command)
+    )
+    application.add_handler(
+        CommandHandler("price", price_command)
+    )
+    application.add_handler(
+        CommandHandler("scan", scan_command)
+    )
+    application.add_handler(
+        CommandHandler("watch", watch_command)
+    )
+    application.add_handler(
+        CommandHandler("unwatch", unwatch_command)
+    )
+    application.add_handler(
+        CallbackQueryHandler(button_handler)
+    )
+
+    web_runner = None
+
+    try:
+        await application.initialize()
+        await application.start()
+
+        if application.updater is None:
+            raise RuntimeError(
+                "Telegram updater не создан."
+            )
+
+        await application.updater.start_polling(
+            drop_pending_updates=True
+        )
+
+        web_runner = await start_web_server()
+
+        logger.info("SEIRANBOT успешно запущен.")
+
+        await asyncio.Event().wait()
+
+    finally:
+        logger.info("Остановка SEIRANBOT...")
+
+        if web_runner is not None:
+            await web_runner.cleanup()
+
+        if application.updater is not None:
+            if application.updater.running:
+                await application.updater.stop()
+
+        if application.running:
+            await application.stop()
+
+        await application.shutdown()
+
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        logger.info("SEIRANBOT остановлен.")
