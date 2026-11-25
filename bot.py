@@ -26,7 +26,7 @@ from telegram.ext import (
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 
 POLL_SECONDS = int(os.getenv("POLL_SECONDS", "300"))
-SCAN_LIMIT = int(os.getenv("SCAN_LIMIT", "30"))
+SCAN_LIMIT = int(os.getenv("SCAN_LIMIT", "36"))
 MIN_SCORE = int(os.getenv("MIN_SCORE", "3"))
 
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
