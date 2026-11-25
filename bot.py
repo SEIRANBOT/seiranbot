@@ -1201,7 +1201,7 @@ async def button_handler(
             "/scan\n"
             "/watch EURUSD=X 5m\n"
             "/unwatch"
-)
+        )
     
 
 # ============================================================
