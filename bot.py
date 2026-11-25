@@ -560,7 +560,7 @@ def format_market_message(result: dict) -> str:
     technical = primary["technical"]
 
     signal = result["final_signal"]
-
+    trade_levels = result.get("trade_levels")
     emoji = {
         "BUY": "🟢",
         "SELL": "🔴",
