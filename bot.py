@@ -1182,7 +1182,7 @@ async def error_handler(
     logger.error(
         "Ошибка Telegram:",
         exc_info=context.error,
-    )
+)
 
 
 # ============================================================
