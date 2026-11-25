@@ -609,13 +609,15 @@ def format_market_message(result: dict) -> str:
             f"TAKE PROFIT 1: {trade_levels['take_profit_1']:.8f}",
             f"TAKE PROFIT 2: {trade_levels['take_profit_2']:.8f}",
             f"TAKE PROFIT 3: {trade_levels['take_profit_3']:.8f}",
-        ])
+            ])
+
+    lines.extend([
         "",
         "🔎 ПОДТВЕРЖДЕНИЕ ТАЙМФРЕЙМОВ",
-    ]
+    ])
 
     if result["confirmations"]:
-
+        
         for confirmation in result["confirmations"]:
 
             tech = confirmation["technical"]
