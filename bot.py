@@ -251,7 +251,19 @@ def download_market_data(
     data = data.dropna(
         subset=["Open", "High", "Low", "Close"]
     ).copy()
+    # Создание свечей 2m, 3m и 10m
+    if interval in ("2m", "3m", "10m"):
 
+        data = data.resample(
+            f"{interval[:-1]}min"
+        ).agg({
+            "Open": "first",
+            "High": "max",
+            "Low": "min",
+            "Close": "last",
+            "Volume": "sum",
+        }).dropna(subset=["Close"])
+        
     if interval == "4h":
         data = data.resample(
             "4h",
