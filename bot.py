@@ -1044,7 +1044,7 @@ async def watch_command(
 
     chat_id = update.effective_chat.id
 
-    key = (chat_id, symbol)
+    key = (chat_id, symbol, interval)
 
     if key in watch_jobs:
 
