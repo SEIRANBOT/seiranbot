@@ -517,15 +517,38 @@ async def analyze_market(
             if aligned == 0 or opposing > 0:
                 final_signal = "WAIT"
 
+    indicators = primary["indicators"]
+    entry = indicators["price"]
+    atr = indicators["atr"]
+
+    trade_levels = None
+
+    if final_signal == "BUY":
+        trade_levels = {
+            "entry": entry,
+            "stop_loss": entry - (1.5 * atr),
+            "take_profit_1": entry + (1.0 * atr),
+            "take_profit_2": entry + (2.0 * atr),
+            "take_profit_3": entry + (3.0 * atr),
+        }
+
+    elif final_signal == "SELL":
+        trade_levels = {
+            "entry": entry,
+            "stop_loss": entry + (1.5 * atr),
+            "take_profit_1": entry - (1.0 * atr),
+            "take_profit_2": entry - (2.0 * atr),
+            "take_profit_3": entry - (3.0 * atr),
+        }
+
     return {
         "primary": primary,
         "confirmations": confirmation_results,
         "final_signal": final_signal,
         "aligned": aligned,
         "opposing": opposing,
+        "trade_levels": trade_levels,
     }
-
-
 # ============================================================
 # SIGNAL MESSAGE
 # ============================================================
