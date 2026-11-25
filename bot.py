@@ -1062,7 +1062,7 @@ async def watch_command(
             "interval": interval,
             "chat_id": chat_id,
         },
-        name=f"{chat_id}_{symbol}",
+        name=f"{chat_id}_{symbol}_{interval}",
     )
 
     watch_jobs[key] = job
