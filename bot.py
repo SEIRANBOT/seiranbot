@@ -596,7 +596,20 @@ def format_market_message(result: dict) -> str:
         f"ATR: {indicators['atr']:.8f}",
         "",
         "📌 ПРИЧИНЫ",
-        reasons,
+                reasons,
+        "",
+    ]
+
+    if trade_levels:
+        lines.extend([
+            "",
+            "🎯 ТОРГОВЫЕ УРОВНИ (ATR)",
+            f"ENTRY: {trade_levels['entry']:.8f}",
+            f"STOP LOSS: {trade_levels['stop_loss']:.8f}",
+            f"TAKE PROFIT 1: {trade_levels['take_profit_1']:.8f}",
+            f"TAKE PROFIT 2: {trade_levels['take_profit_2']:.8f}",
+            f"TAKE PROFIT 3: {trade_levels['take_profit_3']:.8f}",
+        ])
         "",
         "🔎 ПОДТВЕРЖДЕНИЕ ТАЙМФРЕЙМОВ",
     ]
