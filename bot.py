@@ -821,7 +821,7 @@ async def scan_markets(
     found = []
 
     symbols = list(MARKET_SYMBOLS.items())[:SCAN_LIMIT]
-
+    
     for symbol, name in symbols:
 
         try:
