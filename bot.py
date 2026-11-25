@@ -166,18 +166,49 @@ def get_symbol_name(symbol: str) -> str:
     return MARKET_SYMBOLS.get(symbol, symbol)
 
 
+
 def get_interval(value: str) -> str:
+    interval = value.strip().upper()
+
+    interval_map = {
+        "S5": "S5",
+        "S10": "S10",
+        "S15": "S15",
+        "S30": "S30",
+        "M1": "1m",
+        "M2": "2m",
+        "M3": "3m",
+        "M5": "5m",
+        "M10": "10m",
+        "M15": "15m",
+        "M30": "30m",
+        "H1": "1h",
+        "H4": "4h",
+        "D1": "1d",
+
+        "1M": "1m",
+        "2M": "2m",
+        "3M": "3m",
+        "5M": "5m",
+        "10M": "10m",
+        "15M": "15m",
+        "30M": "30m",
+    }
+
+    if interval in interval_map:
+        return interval_map[interval]
+
     interval = value.strip().lower()
 
-    if interval not in INTERVALS:
-        raise ValueError(
-            "Неверный таймфрейм.\n"
-            "Доступны: 1m, 5m, 15m, 30m, 1h, 4h, 1d."
-        )
+    if interval in INTERVALS:
+        return interval
 
-    return interval
-
-
+    raise ValueError(
+        "Неверный таймфрейм. "
+        "Доступны: S5, S10, S15, S30, "
+        "M1, M2, M3, M5, M10, M15, M30, H1, H4, D1."
+    )
+    
 # ============================================================
 # MARKET DATA
 # ============================================================
