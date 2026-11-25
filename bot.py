@@ -119,6 +119,40 @@ CONFIRMATION_INTERVALS = {
     "1d": [],
 }
 
+# ============================================================
+# MARKET CATEGORIES
+# ============================================================
+
+MARKET_CATEGORIES = {
+    "cat_forex": [
+        "EURUSD=X", "GBPUSD=X", "USDJPY=X",
+        "AUDUSD=X", "USDCAD=X", "USDCHF=X",
+        "NZDUSD=X", "EURGBP=X", "EURJPY=X",
+        "GBPJPY=X",
+    ],
+
+    "cat_crypto": [
+        "BTC-USD", "ETH-USD", "SOL-USD",
+        "XRP-USD", "BNB-USD", "DOGE-USD",
+        "ADA-USD", "AVAX-USD",
+    ],
+
+    "cat_stocks": [
+        "AAPL", "MSFT", "NVDA", "TSLA",
+        "AMZN", "GOOGL", "META", "AMD",
+    ],
+
+    "cat_indices": [
+        "^GSPC", "^IXIC", "^DJI",
+        "^FTSE", "^GDAXI",
+    ],
+
+    "cat_commodities": [
+        "GC=F", "SI=F", "CL=F",
+        "BZ=F", "NG=F",
+    ],
+}
+
 
 # ============================================================
 # BASIC FUNCTIONS
