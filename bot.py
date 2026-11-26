@@ -530,9 +530,6 @@ async def run_scan(message):
 async def scan_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await run_scan(update.effective_message)
 
-
-Python
-
 async def watch_job(context: ContextTypes.DEFAULT_TYPE):
     job = context.job
     if job is None or job.chat_id is None:
