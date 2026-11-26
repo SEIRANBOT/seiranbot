@@ -531,65 +531,101 @@ async def scan_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await run_scan(update.effective_message)
 
 
-async def watch_loop(application: Application, chat_id: int, symbol: str, interval: str):
-    try:
-        while True:
-            try:
-                result = await analyze_market(symbol, interval)
-                await application.bot.send_message(chat_id=chat_id, text=format_market_message(result))
-            except Exception as exc:
-                logger.exception("Watch failed for %s", symbol)
-                await application.bot.send_message(chat_id=chat_id, text=f"⚠️ Ошибка наблюдения {symbol}: {exc}")
-            await asyncio.sleep(POLL_SECONDS)
-    except asyncio.CancelledError:
-        raise
-        
-async def watch_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not update.effective_chat:
+Python
+
+async def watch_job(context: ContextTypes.DEFAULT_TYPE):
+    job = context.job
+    if job is None or job.chat_id is None:
         return
 
-    chat_id = update.effective_chat.id
+    chat_id = job.chat_id
+    data = job.data or {}
+    symbol = data.get("symbol")
+    interval = data.get("interval", "5m")
+
+    try:
+        result = await analyze_market(symbol, interval)
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=format_market_message(result)
+        )
+    except Exception as exc:
+        logger.exception("Watch failed for %s", symbol)
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=f"⚠️ Ошибка наблюдения {symbol}: {str(exc)[:1000]}"
+        )
+
+
+async def watch_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    message = update.effective_message
+    chat = update.effective_chat
+
+    if not message or not chat:
+        return
 
     if context.job_queue is None:
-        await update.message.reply_text(
-            "❌ Планировщик недоступен. Проверь установку python-telegram-bot."
-        )
+        await message.reply_text("❌ Планировщик недоступен. Проверь requirements.txt.")
         return
 
+    if not context.args:
+        await message.reply_text("Пример: /watch EUR/USD 5m")
+        return
+
+    symbol = context.args[0].upper().replace("-", "/")
+    interval = context.args[1].lower() if len(context.args) > 1 else "5m"
+
+    if symbol not in FOREX_SYMBOLS:
+        await message.reply_text("❌ Неизвестная валютная пара. Используй /symbols.")
+        return
+
+    if interval not in INTERVALS:
+        await message.reply_text("❌ Неверный таймфрейм. Доступны: " + ", ".join(INTERVALS))
+        return
+
+    chat_id = chat.id
     jobs = context.job_queue.get_jobs_by_name(str(chat_id))
+
     if jobs:
-        await update.message.reply_text(
-            "👁 Наблюдение уже запущено."
-        )
+        await message.reply_text("👁 Наблюдение уже запущено. Сначала останови его командой /stop.")
         return
 
     context.job_queue.run_repeating(
-        watch_loop,
+        watch_job,
         interval=POLL_SECONDS,
         first=1,
         chat_id=chat_id,
         name=str(chat_id),
+        data={"symbol": symbol, "interval": interval},
     )
 
-    await update.message.reply_text(
-        "👁 Наблюдение за рынком запущено."
+    await message.reply_text(
+        f"👁 Наблюдение запущено: {symbol}, {interval}.\n"
+        f"Проверка каждые {POLL_SECONDS // 60} минут."
     )
 
 
 async def stop_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not update.effective_chat:
+    message = update.effective_message
+    chat = update.effective_chat
+
+    if not message or not chat:
         return
 
-    chat_id = update.effective_chat.id
-    jobs = context.job_queue.get_jobs_by_name(str(chat_id))
+    if context.job_queue is None:
+        await message.reply_text("❌ Планировщик недоступен.")
+        return
+
+    jobs = context.job_queue.get_jobs_by_name(str(chat.id))
 
     for job in jobs:
         job.schedule_removal()
 
     if jobs:
-        await update.message.reply_text("⏹ Наблюдение остановлено.")
+        await message.reply_text("⏹ Наблюдение остановлено.")
     else:
-        await update.message.reply_text("Наблюдение не было запущено.")
+        await message.reply_text("Наблюдение не было запущено.")
+
 
 async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -646,6 +682,9 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parts = data.split(":", 2)
         if len(parts) == 3 and query.message:
             await send_analysis(query.message, parts[1], parts[2])
+
+
+def main():
     if not BOT_TOKEN:
         raise RuntimeError("Не задан BOT_TOKEN")
 
@@ -661,10 +700,9 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     application.add_handler(CommandHandler("scan", scan_command))
     application.add_handler(CommandHandler("watch", watch_command))
     application.add_handler(CommandHandler("stop", stop_command))
+    application.add_handler(CommandHandler("unwatch", stop_command))
 
-    application.add_handler(
-        CallbackQueryHandler(button_callback)
-    )
+    application.add_handler(CallbackQueryHandler(button_callback))
 
     logging.info("SEIRANBOT запускается...")
     application.run_polling()
@@ -672,4 +710,3 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 if __name__ == "__main__":
     main()
-
