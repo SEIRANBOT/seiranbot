@@ -1,14 +1,14 @@
-
 import os
+import json
+import time
 import asyncio
 import logging
 from datetime import datetime, timezone
+from urllib.parse import urlencode
+from urllib.request import Request, urlopen
+from urllib.error import HTTPError, URLError
 
 import pandas as pd
-import yfinance as yf
-
-from aiohttp import web
-
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application,
@@ -17,97 +17,50 @@ from telegram.ext import (
     ContextTypes,
 )
 
-
 # ============================================================
-# SEIRANBOT — INDEPENDENT MARKET ANALYTICS ENGINE
-# No OpenAI / No AI API
+# SEIRANBOT — FOREX ANALYTICS ENGINE
+# Market data: Twelve Data REST API. No OTC. No auto-trading.
 # ============================================================
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
+TWELVE_DATA_API_KEY = os.getenv("TWELVE_DATA_API_KEY", "").strip()
 
-POLL_SECONDS = int(os.getenv("POLL_SECONDS", "300"))
-SCAN_LIMIT = int(os.getenv("SCAN_LIMIT", "36"))
-MIN_SCORE = int(os.getenv("MIN_SCORE", "3"))
+POLL_SECONDS = max(60, int(os.getenv("POLL_SECONDS", "900")))
+SCAN_LIMIT = max(1, min(2, int(os.getenv("SCAN_LIMIT", "2"))))
+MIN_SCORE = max(2, min(4, int(os.getenv("MIN_SCORE", "3"))))
+CACHE_TTL_SECONDS = max(15, int(os.getenv("CACHE_TTL_SECONDS", "60")))
+REQUEST_TIMEOUT = max(5, int(os.getenv("REQUEST_TIMEOUT", "20")))
 
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
-
 logging.basicConfig(
     level=getattr(logging, LOG_LEVEL, logging.INFO),
-    format="%(asctime)s | %(levelname)s | %(message)s",
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
 )
-
 logger = logging.getLogger("SEIRANBOT")
 
-watch_jobs = {}
-last_signals = {}
-
-
-# ============================================================
-# MARKET SYMBOLS
-# ============================================================
-
-MARKET_SYMBOLS = {
-    # FOREX
-    "EURUSD=X": "Forex EUR/USD",
-    "GBPUSD=X": "Forex GBP/USD",
-    "USDJPY=X": "Forex USD/JPY",
-    "AUDUSD=X": "Forex AUD/USD",
-    "USDCAD=X": "Forex USD/CAD",
-    "USDCHF=X": "Forex USD/CHF",
-    "NZDUSD=X": "Forex NZD/USD",
-    "EURGBP=X": "Forex EUR/GBP",
-    "EURJPY=X": "Forex EUR/JPY",
-    "GBPJPY=X": "Forex GBP/JPY",
-
-    # CRYPTO
-    "BTC-USD": "Bitcoin",
-    "ETH-USD": "Ethereum",
-    "SOL-USD": "Solana",
-    "XRP-USD": "XRP",
-    "BNB-USD": "BNB",
-    "DOGE-USD": "Dogecoin",
-    "ADA-USD": "Cardano",
-    "AVAX-USD": "Avalanche",
-
-    # STOCKS
-    "AAPL": "Apple",
-    "MSFT": "Microsoft",
-    "NVDA": "Nvidia",
-    "TSLA": "Tesla",
-    "AMZN": "Amazon",
-    "GOOGL": "Alphabet",
-    "META": "Meta",
-    "AMD": "AMD",
-
-    # INDICES
-    "^GSPC": "S&P 500",
-    "^IXIC": "NASDAQ",
-    "^DJI": "Dow Jones",
-    "^FTSE": "FTSE 100",
-    "^GDAXI": "DAX",
-
-    # COMMODITIES
-    "GC=F": "Gold",
-    "SI=F": "Silver",
-    "CL=F": "Crude Oil",
-    "BZ=F": "Brent Oil",
-    "NG=F": "Natural Gas",
+# Twelve Data uses slash-separated currency pairs.
+FOREX_SYMBOLS = {
+    "EUR/USD": "EUR/USD",
+    "GBP/USD": "GBP/USD",
+    "USD/JPY": "USD/JPY",
+    "AUD/USD": "AUD/USD",
+    "USD/CAD": "USD/CAD",
+    "USD/CHF": "USD/CHF",
+    "NZD/USD": "NZD/USD",
+    "EUR/GBP": "EUR/GBP",
+    "EUR/JPY": "EUR/JPY",
+    "GBP/JPY": "GBP/JPY",
 }
-
-
-# Yahoo Finance supported intervals.
-# 4h is constructed from 1h candles.
 
 INTERVALS = {
-    "1m": ("1m", "5d"),
-    "5m": ("5m", "5d"),
-    "15m": ("15m", "5d"),
-    "30m": ("30m", "1mo"),
-    "1h": ("60m", "1mo"),
-    "4h": ("60m", "3mo"),
-    "1d": ("1d", "2y"),
+    "1m": "1min",
+    "5m": "5min",
+    "15m": "15min",
+    "30m": "30min",
+    "1h": "1h",
+    "4h": "4h",
+    "1d": "1day",
 }
-
 
 CONFIRMATION_INTERVALS = {
     "1m": ["5m", "15m"],
@@ -119,285 +72,139 @@ CONFIRMATION_INTERVALS = {
     "1d": [],
 }
 
-# ============================================================
-# MARKET CATEGORIES
-# ============================================================
-
-MARKET_CATEGORIES = {
-    "cat_forex": [
-        "EURUSD=X", "GBPUSD=X", "USDJPY=X",
-        "AUDUSD=X", "USDCAD=X", "USDCHF=X",
-        "NZDUSD=X", "EURGBP=X", "EURJPY=X",
-        "GBPJPY=X",
-    ],
-
-    "cat_crypto": [
-        "BTC-USD", "ETH-USD", "SOL-USD",
-        "XRP-USD", "BNB-USD", "DOGE-USD",
-        "ADA-USD", "AVAX-USD",
-    ],
-
-    "cat_stocks": [
-        "AAPL", "MSFT", "NVDA", "TSLA",
-        "AMZN", "GOOGL", "META", "AMD",
-    ],
-
-    "cat_indices": [
-        "^GSPC", "^IXIC", "^DJI",
-        "^FTSE", "^GDAXI",
-    ],
-
-    "cat_commodities": [
-        "GC=F", "SI=F", "CL=F",
-        "BZ=F", "NG=F",
-    ],
-}
+# Cache keeps repeated button presses from spending API credits.
+_data_cache = {}
+_watch_tasks = {}
 
 
 # ============================================================
-# BASIC FUNCTIONS
+# TWELVE DATA
 # ============================================================
 
-def normalize_symbol(value: str) -> str:
-    return value.strip().upper()
-
-
-def get_symbol_name(symbol: str) -> str:
-    return MARKET_SYMBOLS.get(symbol, symbol)
-
-
-
-def get_interval(value: str) -> str:
-    interval = value.strip().upper()
-
-    interval_map = {
-        "S5": "S5",
-        "S10": "S10",
-        "S15": "S15",
-        "S30": "S30",
-        "M1": "1m",
-        "M2": "2m",
-        "M3": "3m",
-        "M5": "5m",
-        "M10": "10m",
-        "M15": "15m",
-        "M30": "30m",
-        "H1": "1h",
-        "H4": "4h",
-        "D1": "1d",
-
-        "1M": "1m",
-        "2M": "2m",
-        "3M": "3m",
-        "5M": "5m",
-        "10M": "10m",
-        "15M": "15m",
-        "30M": "30m",
-    }
-
-    if interval in interval_map:
-        return interval_map[interval]
-
-    interval = value.strip().lower()
-
-    if interval in INTERVALS:
-        return interval
-
-    raise ValueError(
-        "Неверный таймфрейм. "
-        "Доступны: S5, S10, S15, S30, "
-        "M1, M2, M3, M5, M10, M15, M30, H1, H4, D1."
-    )
-    
-# ============================================================
-# MARKET DATA
-# ============================================================
-
-def download_market_data(
-    symbol: str,
-    interval: str,
-) -> pd.DataFrame:
-
-    if interval not in INTERVALS:
-        raise ValueError("Неизвестный таймфрейм.")
-
-    yahoo_interval, period = INTERVALS[interval]
-
-    ticker = yf.Ticker(symbol)
-
-    data = ticker.history(
-        period=period,
-        interval=yahoo_interval,
-        auto_adjust=True,
-        actions=False,
-    )
-
-    if data is None or data.empty:
-        raise ValueError(
-            f"Нет доступных котировок для {symbol}."
+def _fetch_twelve_data(symbol: str, interval: str) -> pd.DataFrame:
+    if not TWELVE_DATA_API_KEY:
+        raise RuntimeError(
+            "Не задан TWELVE_DATA_API_KEY. Добавь API-ключ Twelve Data в Environment на Render."
         )
 
-    required = ["Open", "High", "Low", "Close"]
+    api_interval = INTERVALS.get(interval)
+    if not api_interval:
+        raise ValueError(f"Неподдерживаемый таймфрейм: {interval}")
 
-    for column in required:
-        if column not in data.columns:
-            raise ValueError(
-                f"Отсутствует колонка {column} для {symbol}."
-            )
+    params = urlencode({
+        "symbol": symbol,
+        "interval": api_interval,
+        "outputsize": 120,
+        "timezone": "UTC",
+        "order": "desc",
+        "apikey": TWELVE_DATA_API_KEY,
+    })
+    url = f"https://api.twelvedata.com/time_series?{params}"
+    request = Request(url, headers={"User-Agent": "SEIRANBOT/1.0"})
 
-    if "Volume" not in data.columns:
-        data["Volume"] = 0
+    try:
+        with urlopen(request, timeout=REQUEST_TIMEOUT) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+    except HTTPError as exc:
+        body = exc.read().decode("utf-8", errors="replace")
+        raise RuntimeError(f"Twelve Data HTTP {exc.code}: {body[:350]}") from exc
+    except (URLError, TimeoutError) as exc:
+        raise RuntimeError(f"Не удалось связаться с Twelve Data: {exc}") from exc
+    except json.JSONDecodeError as exc:
+        raise RuntimeError("Twelve Data вернул некорректный ответ.") from exc
 
-    data = data.dropna(
-        subset=["Open", "High", "Low", "Close"]
-    ).copy()
-    # Создание свечей 2m, 3m и 10m
-    if interval in ("2m", "3m", "10m"):
+    if isinstance(payload, dict) and payload.get("status") == "error":
+        code = payload.get("code", "?")
+        message = payload.get("message", "Неизвестная ошибка API")
+        raise RuntimeError(f"Twelve Data ({code}): {message}")
 
-        data = data.resample(
-            f"{interval[:-1]}min"
-        ).agg({
-            "Open": "first",
-            "High": "max",
-            "Low": "min",
-            "Close": "last",
-            "Volume": "sum",
-        }).dropna(subset=["Close"])
-        
-    if interval == "4h":
-        data = data.resample(
-            "4h",
-            origin="start_day",
-        ).agg({
-            "Open": "first",
-            "High": "max",
-            "Low": "min",
-            "Close": "last",
-            "Volume": "sum",
-        }).dropna(subset=["Close"])
+    values = payload.get("values") if isinstance(payload, dict) else None
+    if not values:
+        raise RuntimeError(f"Нет свечей для {symbol} на таймфрейме {interval}.")
 
-    if len(data) < 55:
-        raise ValueError(
-            f"Недостаточно свечей для {symbol} ({interval})."
+    frame = pd.DataFrame(values)
+    required = ["datetime", "open", "high", "low", "close"]
+    missing = [column for column in required if column not in frame.columns]
+    if missing:
+        raise RuntimeError(f"В ответе Twelve Data отсутствуют поля: {', '.join(missing)}")
+
+    frame = frame.rename(columns={
+        "datetime": "Datetime",
+        "open": "Open",
+        "high": "High",
+        "low": "Low",
+        "close": "Close",
+        "volume": "Volume",
+    })
+    frame["Datetime"] = pd.to_datetime(frame["Datetime"], utc=True, errors="coerce")
+    for column in ["Open", "High", "Low", "Close"]:
+        frame[column] = pd.to_numeric(frame[column], errors="coerce")
+    if "Volume" not in frame.columns:
+        frame["Volume"] = 0.0
+    else:
+        frame["Volume"] = pd.to_numeric(frame["Volume"], errors="coerce").fillna(0.0)
+
+    frame = frame.dropna(subset=["Datetime", "Open", "High", "Low", "Close"])
+    frame = frame.sort_values("Datetime").set_index("Datetime")
+    if len(frame) < 55:
+        raise RuntimeError(
+            f"Недостаточно истории для {symbol} ({interval}): получено {len(frame)} свечей, нужно минимум 55."
         )
+    return frame[["Open", "High", "Low", "Close", "Volume"]]
 
-    return data
+
+async def get_market_data(symbol: str, interval: str) -> pd.DataFrame:
+    key = (symbol, interval)
+    now = time.monotonic()
+    cached = _data_cache.get(key)
+    if cached and now - cached[0] < CACHE_TTL_SECONDS:
+        return cached[1].copy()
+
+    frame = await asyncio.to_thread(_fetch_twelve_data, symbol, interval)
+    _data_cache[key] = (time.monotonic(), frame)
+    return frame.copy()
 
 
 # ============================================================
-# TECHNICAL INDICATORS
+# INDICATORS AND SIGNAL LOGIC
 # ============================================================
 
 def calculate_indicators(data: pd.DataFrame) -> dict:
-
     close = data["Close"].astype(float)
     high = data["High"].astype(float)
     low = data["Low"].astype(float)
 
-    # EMA
-    ema9 = close.ewm(
-        span=9,
-        adjust=False,
-    ).mean()
+    ema9 = close.ewm(span=9, adjust=False).mean()
+    ema21 = close.ewm(span=21, adjust=False).mean()
+    ema50 = close.ewm(span=50, adjust=False).mean()
 
-    ema21 = close.ewm(
-        span=21,
-        adjust=False,
-    ).mean()
-
-    ema50 = close.ewm(
-        span=50,
-        adjust=False,
-    ).mean()
-
-    # RSI — Wilder smoothing
     delta = close.diff()
-
     gains = delta.clip(lower=0)
     losses = -delta.clip(upper=0)
-
-    avg_gain = gains.ewm(
-        alpha=1 / 14,
-        min_periods=14,
-        adjust=False,
-    ).mean()
-
-    avg_loss = losses.ewm(
-        alpha=1 / 14,
-        min_periods=14,
-        adjust=False,
-    ).mean()
-
-    rs = avg_gain / avg_loss.replace(
-        0,
-        float("nan"),
-    )
-
+    avg_gain = gains.ewm(alpha=1 / 14, min_periods=14, adjust=False).mean()
+    avg_loss = losses.ewm(alpha=1 / 14, min_periods=14, adjust=False).mean()
+    rs = avg_gain / avg_loss.replace(0, float("nan"))
     rsi = 100 - (100 / (1 + rs))
+    rsi = rsi.mask((avg_loss == 0) & (avg_gain > 0), 100)
+    rsi = rsi.mask((avg_loss == 0) & (avg_gain == 0), 50)
 
-    # Correct handling of zero gains and losses.
-    rsi = rsi.mask(
-        (avg_loss == 0) & (avg_gain > 0),
-        100,
-    )
-
-    rsi = rsi.mask(
-        (avg_loss == 0) & (avg_gain == 0),
-        50,
-    )
-
-    # MACD
-    ema12 = close.ewm(
-        span=12,
-        adjust=False,
-    ).mean()
-
-    ema26 = close.ewm(
-        span=26,
-        adjust=False,
-    ).mean()
-
+    ema12 = close.ewm(span=12, adjust=False).mean()
+    ema26 = close.ewm(span=26, adjust=False).mean()
     macd = ema12 - ema26
+    macd_signal = macd.ewm(span=9, adjust=False).mean()
 
-    macd_signal = macd.ewm(
-        span=9,
-        adjust=False,
-    ).mean()
-
-    macd_histogram = macd - macd_signal
-
-    # ATR
     previous_close = close.shift(1)
+    true_range = pd.concat([
+        high - low,
+        (high - previous_close).abs(),
+        (low - previous_close).abs(),
+    ], axis=1).max(axis=1)
+    atr = true_range.ewm(alpha=1 / 14, adjust=False).mean()
 
-    true_range = pd.concat(
-        [
-            high - low,
-            (high - previous_close).abs(),
-            (low - previous_close).abs(),
-        ],
-        axis=1,
-    ).max(axis=1)
-
-    atr = true_range.ewm(
-        alpha=1 / 14,
-        adjust=False,
-    ).mean()
-
-    values = [
-        close.iloc[-1],
-        ema9.iloc[-1],
-        ema21.iloc[-1],
-        ema50.iloc[-1],
-        rsi.iloc[-1],
-        macd.iloc[-1],
-        macd_signal.iloc[-1],
-        atr.iloc[-1],
-    ]
-
+    values = [close.iloc[-1], ema9.iloc[-1], ema21.iloc[-1], ema50.iloc[-1],
+              rsi.iloc[-1], macd.iloc[-1], macd_signal.iloc[-1], atr.iloc[-1]]
     if any(pd.isna(value) for value in values):
-        raise ValueError(
-            "Ошибка расчёта технических индикаторов."
-        )
+        raise RuntimeError("Не удалось рассчитать технические индикаторы.")
 
     return {
         "price": float(close.iloc[-1]),
@@ -408,453 +215,335 @@ def calculate_indicators(data: pd.DataFrame) -> dict:
         "rsi": float(rsi.iloc[-1]),
         "macd": float(macd.iloc[-1]),
         "macd_signal": float(macd_signal.iloc[-1]),
-        "macd_histogram": float(macd_histogram.iloc[-1]),
         "atr": float(atr.iloc[-1]),
-        "volume": float(data["Volume"].iloc[-1]),
     }
 
 
-# ============================================================
-# TECHNICAL ANALYSIS ENGINE
-# ============================================================
-
 def technical_analysis(indicators: dict) -> dict:
-
     score = 0
     reasons = []
-
     price = indicators["price"]
-    ema9 = indicators["ema9"]
-    ema21 = indicators["ema21"]
-    ema50 = indicators["ema50"]
-    rsi = indicators["rsi"]
-    macd = indicators["macd"]
-    macd_signal = indicators["macd_signal"]
 
-    # EMA trend
-    if ema9 > ema21:
+    if indicators["ema9"] > indicators["ema21"]:
         score += 1
         reasons.append("EMA 9 выше EMA 21")
-
-    elif ema9 < ema21:
+    elif indicators["ema9"] < indicators["ema21"]:
         score -= 1
         reasons.append("EMA 9 ниже EMA 21")
 
-    # Long trend
-    if price > ema50:
+    if price > indicators["ema50"]:
         score += 1
         reasons.append("Цена выше EMA 50")
-
-    elif price < ema50:
+    elif price < indicators["ema50"]:
         score -= 1
         reasons.append("Цена ниже EMA 50")
 
-    # MACD
-    if macd > macd_signal:
+    if indicators["macd"] > indicators["macd_signal"]:
         score += 1
         reasons.append("MACD подтверждает рост")
-
-    elif macd < macd_signal:
+    elif indicators["macd"] < indicators["macd_signal"]:
         score -= 1
         reasons.append("MACD подтверждает снижение")
 
-    # RSI
+    rsi = indicators["rsi"]
     if 50 < rsi < 70:
         score += 1
         reasons.append("RSI поддерживает рост")
-
     elif 30 < rsi < 50:
         score -= 1
         reasons.append("RSI поддерживает снижение")
-
     elif rsi >= 70:
-        reasons.append("RSI: перекупленность")
-
+        reasons.append("RSI: зона перекупленности")
     elif rsi <= 30:
-        reasons.append("RSI: перепроданность")
+        reasons.append("RSI: зона перепроданности")
 
-    # Signal
-    if score >= MIN_SCORE:
-        signal = "BUY"
-
-    elif score <= -MIN_SCORE:
-        signal = "SELL"
-
-    else:
-        signal = "WAIT"
-
-    return {
-        "signal": signal,
-        "score": score,
-        "reasons": reasons,
-    }
+    signal = "BUY" if score >= MIN_SCORE else "SELL" if score <= -MIN_SCORE else "WAIT"
+    return {"signal": signal, "score": score, "reasons": reasons}
 
 
-# ============================================================
-# SINGLE TIMEFRAME ANALYSIS
-# ============================================================
-
-async def analyze_timeframe(
-    symbol: str,
-    interval: str,
-) -> dict:
-
-    data = await asyncio.to_thread(
-        download_market_data,
-        symbol,
-        interval,
-    )
-
+async def analyze_timeframe(symbol: str, interval: str) -> dict:
+    data = await get_market_data(symbol, interval)
     indicators = calculate_indicators(data)
-    technical = technical_analysis(indicators)
-
     return {
         "symbol": symbol,
-        "name": get_symbol_name(symbol),
         "interval": interval,
         "indicators": indicators,
-        "technical": technical,
-        "timestamp": datetime.now(
-            timezone.utc
-        ).isoformat(),
+        "technical": technical_analysis(indicators),
+        "candle_time": data.index[-1].to_pydatetime(),
     }
 
 
-# ============================================================
-# MULTI-TIMEFRAME CONFIRMATION
-# ============================================================
+async def analyze_market(symbol: str, interval: str) -> dict:
+    primary = await analyze_timeframe(symbol, interval)
+    confirmation_intervals = CONFIRMATION_INTERVALS.get(interval, [])
+    confirmations = []
+    errors = []
 
-async def analyze_market(
-    symbol: str,
-    interval: str,
-) -> dict:
-
-    primary = await analyze_timeframe(
-        symbol,
-        interval,
-    )
-
-    confirmations = CONFIRMATION_INTERVALS.get(
-        interval,
-        [],
-    )
-
-    confirmation_results = []
-
-    if confirmations:
-        tasks = [
-            analyze_timeframe(symbol, tf)
-            for tf in confirmations
-        ]
-
-        results = await asyncio.gather(
-            *tasks,
-            return_exceptions=True,
-        )
-
-        for tf, result in zip(confirmations, results):
-
-            if isinstance(result, Exception):
-                logger.warning(
-                    "Не удалось подтвердить %s на %s: %s",
-                    symbol,
-                    tf,
-                    result,
-                )
-                continue
-
-            confirmation_results.append(result)
+    # Sequential requests are intentional: they reduce bursts against the free API quota.
+    for confirmation_interval in confirmation_intervals:
+        try:
+            confirmations.append(await analyze_timeframe(symbol, confirmation_interval))
+        except Exception as exc:
+            errors.append(f"{confirmation_interval}: {exc}")
+            logger.warning("Confirmation unavailable for %s %s: %s", symbol, confirmation_interval, exc)
 
     primary_signal = primary["technical"]["signal"]
-
     final_signal = primary_signal
-
     aligned = 0
     opposing = 0
 
-    if primary_signal in ("BUY", "SELL"):
-
-        for result in confirmation_results:
-
-            confirmation = result["technical"]
-
-            if confirmation["signal"] == primary_signal:
+    if primary_signal in ("BUY", "SELL") and confirmation_intervals:
+        for item in confirmations:
+            signal = item["technical"]["signal"]
+            if signal == primary_signal:
                 aligned += 1
-
-            elif (
-                confirmation["signal"] != "WAIT"
-                and confirmation["signal"] != primary_signal
-            ):
+            elif signal in ("BUY", "SELL"):
                 opposing += 1
-
-        # Require at least one higher timeframe confirmation.
-        # Strong opposing signals cancel the entry.
-        if confirmations:
-
-            if aligned == 0 or opposing > 0:
-                final_signal = "WAIT"
+        # If no higher timeframe confirms, or any higher timeframe strongly disagrees, stand aside.
+        if aligned == 0 or opposing > 0 or errors:
+            final_signal = "WAIT"
 
     indicators = primary["indicators"]
     entry = indicators["price"]
     atr = indicators["atr"]
-
-    trade_levels = None
-
+    levels = None
     if final_signal == "BUY":
-        trade_levels = {
+        levels = {
             "entry": entry,
-            "stop_loss": entry - (1.5 * atr),
-            "take_profit_1": entry + (1.0 * atr),
-            "take_profit_2": entry + (2.0 * atr),
-            "take_profit_3": entry + (3.0 * atr),
+            "stop_loss": entry - 1.5 * atr,
+            "take_profit_1": entry + atr,
+            "take_profit_2": entry + 2 * atr,
+            "take_profit_3": entry + 3 * atr,
         }
-
     elif final_signal == "SELL":
-        trade_levels = {
+        levels = {
             "entry": entry,
-            "stop_loss": entry + (1.5 * atr),
-            "take_profit_1": entry - (1.0 * atr),
-            "take_profit_2": entry - (2.0 * atr),
-            "take_profit_3": entry - (3.0 * atr),
+            "stop_loss": entry + 1.5 * atr,
+            "take_profit_1": entry - atr,
+            "take_profit_2": entry - 2 * atr,
+            "take_profit_3": entry - 3 * atr,
         }
 
     return {
         "primary": primary,
-        "confirmations": confirmation_results,
+        "confirmations": confirmations,
+        "confirmation_errors": errors,
         "final_signal": final_signal,
         "aligned": aligned,
         "opposing": opposing,
-        "trade_levels": trade_levels,
+        "trade_levels": levels,
     }
-# ============================================================
-# SIGNAL MESSAGE
-# ============================================================
+
+
+def _price(value: float, symbol: str) -> str:
+    decimals = 3 if symbol.endswith("/JPY") else 5
+    return f"{value:.{decimals}f}"
+
 
 def format_market_message(result: dict) -> str:
-
     primary = result["primary"]
     indicators = primary["indicators"]
     technical = primary["technical"]
-
+    symbol = primary["symbol"]
     signal = result["final_signal"]
-    trade_levels = result.get("trade_levels")
-    emoji = {
-        "BUY": "🟢",
-        "SELL": "🔴",
-        "WAIT": "🟡",
-    }.get(signal, "⚪")
-
-    reasons = "\n".join(
-        f"• {reason}"
-        for reason in technical["reasons"]
-    )
-
-    if not reasons:
-        reasons = "• Нет сильного совпадения условий"
+    emoji = {"BUY": "🟢", "SELL": "🔴", "WAIT": "🟡"}.get(signal, "⚪")
+    reasons = "\n".join(f"• {reason}" for reason in technical["reasons"]) or "• Нет сильного совпадения условий"
 
     lines = [
-        "🤖 SEIRANBOT — АНАЛИЗ РЫНКА",
+        "🤖 SEIRANBOT — FOREX АНАЛИЗ",
         "",
-        f"Инструмент: {primary['name']}",
-        f"Символ: {primary['symbol']}",
-        f"Основной таймфрейм: {primary['interval']}",
-        f"Цена: {indicators['price']:.8f}",
+        f"Пара: {symbol}",
+        f"Таймфрейм: {primary['interval']}",
+        f"Цена: {_price(indicators['price'], symbol)}",
+        f"Время последней свечи UTC: {primary['candle_time'].strftime('%Y-%m-%d %H:%M')}",
         "",
         f"{emoji} ИТОГОВЫЙ СИГНАЛ: {signal}",
         f"Технический балл: {technical['score']} из 4",
         "",
         "📊 ИНДИКАТОРЫ",
         f"RSI: {indicators['rsi']:.2f}",
-        f"EMA 9: {indicators['ema9']:.8f}",
-        f"EMA 21: {indicators['ema21']:.8f}",
-        f"EMA 50: {indicators['ema50']:.8f}",
+        f"EMA 9: {_price(indicators['ema9'], symbol)}",
+        f"EMA 21: {_price(indicators['ema21'], symbol)}",
+        f"EMA 50: {_price(indicators['ema50'], symbol)}",
         f"MACD: {indicators['macd']:.8f}",
         f"MACD Signal: {indicators['macd_signal']:.8f}",
-        f"ATR: {indicators['atr']:.8f}",
+        f"ATR: {_price(indicators['atr'], symbol)}",
         "",
         "📌 ПРИЧИНЫ",
-                reasons,
+        reasons,
         "",
+        "🔎 ПОДТВЕРЖДЕНИЕ СТАРШИХ ТАЙМФРЕЙМОВ",
     ]
 
-    if trade_levels:
+    if result["confirmations"]:
+        for item in result["confirmations"]:
+            lines.append(f"{item['interval']}: {item['technical']['signal']} (балл {item['technical']['score']})")
+        lines.append(f"Совпадений: {result['aligned']}")
+        lines.append(f"Противоречий: {result['opposing']}")
+    elif not CONFIRMATION_INTERVALS.get(primary["interval"], []):
+        lines.append("Для дневного таймфрейма дополнительные подтверждения не заданы.")
+    else:
+        lines.append("Старшие таймфреймы не удалось получить.")
+
+    if result["confirmation_errors"]:
+        lines.append("Ошибки подтверждения: " + " | ".join(result["confirmation_errors"]))
+
+    levels = result.get("trade_levels")
+    if levels:
         lines.extend([
             "",
-            "🎯 ТОРГОВЫЕ УРОВНИ (ATR)",
-            f"ENTRY: {trade_levels['entry']:.8f}",
-            f"STOP LOSS: {trade_levels['stop_loss']:.8f}",
-            f"TAKE PROFIT 1: {trade_levels['take_profit_1']:.8f}",
-            f"TAKE PROFIT 2: {trade_levels['take_profit_2']:.8f}",
-            f"TAKE PROFIT 3: {trade_levels['take_profit_3']:.8f}",
-            ])
+            "🎯 РАСЧЁТНЫЕ УРОВНИ (ATR)",
+            f"ENTRY: {_price(levels['entry'], symbol)}",
+            f"STOP LOSS: {_price(levels['stop_loss'], symbol)}",
+            f"TAKE PROFIT 1: {_price(levels['take_profit_1'], symbol)}",
+            f"TAKE PROFIT 2: {_price(levels['take_profit_2'], symbol)}",
+            f"TAKE PROFIT 3: {_price(levels['take_profit_3'], symbol)}",
+        ])
 
     lines.extend([
         "",
-        "🔎 ПОДТВЕРЖДЕНИЕ ТАЙМФРЕЙМОВ",
+        f"🕒 Сформировано UTC: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')}",
+        "Источник котировок: Twelve Data (Forex)",
+        "⚠️ Сигнал не гарантирует прибыль. Проверяй цену у своего брокера.",
+        "Бот не открывает сделки автоматически. OTC не используется.",
     ])
-
-    if result["confirmations"]:
-        
-        for confirmation in result["confirmations"]:
-
-            tech = confirmation["technical"]
-
-            lines.append(
-                f"{confirmation['interval']}: "
-                f"{tech['signal']} "
-                f"(балл {tech['score']})"
-            )
-
-        lines.append(
-            f"Совпадений: {result['aligned']}"
-        )
-
-        lines.append(
-            f"Противоречий: {result['opposing']}"
-        )
-
-    else:
-        lines.append(
-            "Дополнительные таймфреймы недоступны."
-        )
-
-    lines.extend([
-        "",
-        f"🕒 UTC: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')}",
-        "",
-        "⚠️ Технический сигнал не является гарантией прибыли.",
-        "Котировки Yahoo Finance могут отличаться от Pocket Option OTC.",
-        "Бот не открывает сделки автоматически.",
-    ])
-
     return "\n".join(lines)
 
 
-async def build_signal_message(
-    symbol: str,
-    interval: str,
-) -> str:
-
-    result = await analyze_market(
-        symbol,
-        interval,
-    )
-
-    return format_market_message(result)
-
-
 # ============================================================
-# TELEGRAM KEYBOARD
+# TELEGRAM UI
 # ============================================================
 
 def main_keyboard():
-
     return InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton(
-                "📊 Сигнал",
-                callback_data="signal",
-            ),
-            InlineKeyboardButton(
-                "🔎 Сканирование",
-                callback_data="scan",
-            ),
-        ],
-        [
-            InlineKeyboardButton(
-                "📈 Рынки",
-                callback_data="symbols",
-            ),
-            InlineKeyboardButton(
-                "ℹ️ Помощь",
-                callback_data="help",
-            ),
-        ],
+        [InlineKeyboardButton("📊 Получить сигнал", callback_data="signal")],
+        [InlineKeyboardButton("🔎 Сканировать Forex", callback_data="scan")],
+        [InlineKeyboardButton("💱 Валютные пары", callback_data="symbols"),
+         InlineKeyboardButton("ℹ️ Помощь", callback_data="help")],
     ])
 
 
-# ============================================================
-# TELEGRAM COMMANDS
-# ============================================================
+def symbols_keyboard():
+    rows = []
+    symbols = list(FOREX_SYMBOLS)
+    for index in range(0, len(symbols), 2):
+        row = [InlineKeyboardButton(symbol, callback_data=f"pair:{symbol}") for symbol in symbols[index:index + 2]]
+        rows.append(row)
+    rows.append([InlineKeyboardButton("⬅️ Главное меню", callback_data="home")])
+    return InlineKeyboardMarkup(rows)
 
-async def start_command(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-):
 
-    await update.message.reply_text(
+def intervals_keyboard(symbol: str):
+    rows = []
+    intervals = list(INTERVALS)
+    for index in range(0, len(intervals), 3):
+        rows.append([
+            InlineKeyboardButton(tf, callback_data=f"tf:{symbol}:{tf}")
+            for tf in intervals[index:index + 3]
+        ])
+    rows.append([InlineKeyboardButton("⬅️ К валютным парам", callback_data="symbols")])
+    return InlineKeyboardMarkup(rows)
+
+
+async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.effective_message.reply_text(
         "🤖 SEIRANBOT запущен.\n\n"
-        "Самостоятельный технический анализ рынков.\n"
-        "OpenAI не используется.\n\n"
-        "Сделки открываются вручную.\n\n"
+        "Независимый технический анализ обычного Forex на данных Twelve Data.\n"
         "Выбери действие:",
         reply_markup=main_keyboard(),
     )
 
 
-async def help_command(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-):
-
-    await update.message.reply_text(
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.effective_message.reply_text(
         "📚 КОМАНДЫ SEIRANBOT\n\n"
         "/start — главное меню\n"
         "/help — помощь\n"
-        "/symbols — список рынков\n"
-        "/signal EURUSD=X 5m — анализ\n"
-        "/price BTC-USD — цена\n"
-        "/scan — сканирование\n"
-        "/watch EURUSD=X 5m — наблюдение\n"
+        "/symbols — валютные пары\n"
+        "/signal EUR/USD 5m — анализ пары\n"
+        "/scan — сканирование Forex\n"
+        "/watch EUR/USD 5m — периодическое наблюдение\n"
         "/unwatch — остановить наблюдение\n\n"
-        "Таймфреймы:\n"
-        "1m, 5m, 15m, 30m, 1h, 4h, 1d\n\n"
-        "Примеры:\n"
-        "/signal BTC-USD 15m\n"
-        "/signal GC=F 1h\n"
-        "/watch EURUSD=X 5m"
+        "Таймфреймы: 1m, 5m, 15m, 30m, 1h, 4h, 1d\n"
+        "Источник: Twelve Data. Только обычный Forex, без OTC.\n"
+        "Сделки бот не открывает.",
+        reply_markup=main_keyboard(),
     )
 
 
-async def symbols_command(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-):
-
-    lines = ["📈 ДОСТУПНЫЕ ИНСТРУМЕНТЫ\n"]
-
-    for symbol, name in MARKET_SYMBOLS.items():
-        lines.append(f"{symbol} — {name}")
-
-    await update.message.reply_text(
-        "\n".join(lines)
+async def symbols_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.effective_message.reply_text(
+        "💱 ДОСТУПНЫЕ FOREX-ПАРЫ\n\n" + "\n".join(FOREX_SYMBOLS),
+        reply_markup=symbols_keyboard(),
     )
 
 
-async def signal_command(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-):
-
-    if not context.args:
-        await update.message.reply_text(
-            "Пример:\n/signal EURUSD=X 5m"
-        )
+async def send_analysis(message, symbol: str, interval: str):
+    if symbol not in FOREX_SYMBOLS:
+        await message.reply_text("Эта валютная пара не входит в список SEIRANBOT. Выбери пару из меню /symbols.")
+        return
+    if interval not in INTERVALS:
+        await message.reply_text("Неверный таймфрейм. Доступны: " + ", ".join(INTERVALS))
         return
 
-    symbol = normalize_symbol(context.args[0])
+    status = await message.reply_text(f"⏳ Получаю котировки Twelve Data: {symbol}, {interval}...")
+    try:
+        result = await analyze_market(symbol, interval)
+        await status.edit_text(format_market_message(result))
+    except Exception as exc:
+        logger.exception("Analysis failed for %s %s", symbol, interval)
+        await status.edit_text(f"❌ Не удалось получить сигнал.\n\n{exc}")
 
-    interval = "5m"
 
-    if len(context.args) > 1:
+async def signal_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        await update.effective_message.reply_text("Пример: /signal EUR/USD 5m")
+        return
+    symbol = context.args[0].upper().replace("-", "/")
+    interval = context.args[1].lower() if len(context.args) > 1 else "5m"
+    await send_analysis(update.effective_message, symbol, interval)
+
+
+async def run_scan(message):
+    status = await message.reply_text(f"⏳ Сканирую {SCAN_LIMIT} Forex-пары на таймфрейме 5m. Это займёт некоторое время...")
+    results = []
+    for symbol in list(FOREX_SYMBOLS)[:SCAN_LIMIT]:
         try:
-            interval = get_interval(context.args[1])
-        except ValueError as error:
-            await update.message.reply_text(str(error))
-            return
+            result = await analyze_market(symbol, "5m")
+            results.append((symbol, result["final_signal"], result["primary"]["technical"]["score"]))
+        except Exception as exc:
+            logger.warning("Scan failed for %s: %s", symbol, exc)
+            results.append((symbol, "ERROR", str(exc)[:90]))
+        await asyncio.sleep(1.0)
 
-    status = await update.message.reply_text(
-        f"⏳ Анализирую {symbol}..."
-    )
+    lines = ["🔎 SEIRANBOT — FOREX СКАНИРОВАНИЕ", "", "Таймфрейм: 5m"]
+    for symbol, signal, score in results:
+        if signal == "ERROR":
+            lines.append(f"{symbol}: ❌ {score}")
+        else:
+            emoji = {"BUY": "🟢", "SELL": "🔴", "WAIT": "🟡"}[signal]
+            lines.append(f"{emoji} {symbol}: {signal} (балл {score}/4)")
+    lines.extend(["", "Источник: Twelve Data. Сигналы не гарантируют прибыль."])
+    await status.edit_text("\n".join(lines))
 
-    t
+
+async def scan_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await run_scan(update.effective_message)
+
+
+async def watch_loop(application: Application, chat_id: int, symbol: str, interval: str):
+    try:
+        while True:
+            try:
+                result = await analyze_market(symbol, interval)
+                await application.bot.send_message(chat_id=chat_id, text=format_market_message(result))
+            except Exception as exc:
+                logger.exception("Watch failed for %s", symbol)
+                await application.bot.send_message(chat_id=chat_id, text=f"⚠️ Ошибка наблюдения {symbol}: {exc}")
+            await asyncio.sleep(POLL_SECONDS)
+    except asyncio.CancelledError:
+        raise
+
+
+async def watch_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if len(context.args) 
