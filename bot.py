@@ -591,8 +591,61 @@ async def stop_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         await update.message.reply_text("Наблюдение не было запущено.")
 
+async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if not query:
+        return
 
-def main():
+    await query.answer()
+    data = query.data or ""
+
+    if data == "home":
+        await query.edit_message_text(
+            "🤖 SEIRANBOT — главное меню",
+            reply_markup=main_keyboard()
+        )
+
+    elif data == "help":
+        await query.edit_message_text(
+            "📚 ПОМОЩЬ\n\n"
+            "/start — главное меню\n"
+            "/help — помощь\n"
+            "/symbols — валютные пары\n"
+            "/signal EUR/USD 5m — сигнал\n"
+            "/scan — сканирование\n"
+            "/watch EUR/USD 5m — наблюдение\n"
+            "/stop — остановить наблюдение",
+            reply_markup=main_keyboard()
+        )
+
+    elif data == "symbols":
+        await query.edit_message_text(
+            "💱 Выбери валютную пару:",
+            reply_markup=symbols_keyboard()
+        )
+
+    elif data == "signal":
+        await query.edit_message_text(
+            "📊 Выбери валютную пару:",
+            reply_markup=symbols_keyboard()
+        )
+
+    elif data == "scan":
+        if query.message:
+            await run_scan(query.message)
+
+    elif data.startswith("pair:"):
+        symbol = data.split(":", 1)[1]
+        if symbol in FOREX_SYMBOLS:
+            await query.edit_message_text(
+                f"Выбрана пара {symbol}. Выбери таймфрейм:",
+                reply_markup=intervals_keyboard(symbol)
+            )
+
+    elif data.startswith("tf:"):
+        parts = data.split(":", 2)
+        if len(parts) == 3 and query.message:
+            await send_analysis(query.message, parts[1], parts[2])
     if not BOT_TOKEN:
         raise RuntimeError("Не задан BOT_TOKEN")
 
