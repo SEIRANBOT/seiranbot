@@ -543,7 +543,79 @@ async def watch_loop(application: Application, chat_id: int, symbol: str, interv
             await asyncio.sleep(POLL_SECONDS)
     except asyncio.CancelledError:
         raise
-
-
+        
 async def watch_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if len(context.args) 
+    if not update.effective_chat:
+        return
+
+    chat_id = update.effective_chat.id
+
+    if context.job_queue is None:
+        await update.message.reply_text(
+            "❌ Планировщик недоступен. Проверь установку python-telegram-bot."
+        )
+        return
+
+    jobs = context.job_queue.get_jobs_by_name(str(chat_id))
+    if jobs:
+        await update.message.reply_text(
+            "👁 Наблюдение уже запущено."
+        )
+        return
+
+    context.job_queue.run_repeating(
+        watch_loop,
+        interval=POLL_SECONDS,
+        first=1,
+        chat_id=chat_id,
+        name=str(chat_id),
+    )
+
+    await update.message.reply_text(
+        "👁 Наблюдение за рынком запущено."
+    )
+
+
+async def stop_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.effective_chat:
+        return
+
+    chat_id = update.effective_chat.id
+    jobs = context.job_queue.get_jobs_by_name(str(chat_id))
+
+    for job in jobs:
+        job.schedule_removal()
+
+    if jobs:
+        await update.message.reply_text("⏹ Наблюдение остановлено.")
+    else:
+        await update.message.reply_text("Наблюдение не было запущено.")
+
+
+def main():
+    if not BOT_TOKEN:
+        raise RuntimeError("Не задан BOT_TOKEN")
+
+    if not TWELVE_DATA_API_KEY:
+        raise RuntimeError("Не задан TWELVE_DATA_API_KEY")
+
+    application = Application.builder().token(BOT_TOKEN).build()
+
+    application.add_handler(CommandHandler("start", start_command))
+    application.add_handler(CommandHandler("help", help_command))
+    application.add_handler(CommandHandler("symbols", symbols_command))
+    application.add_handler(CommandHandler("signal", signal_command))
+    application.add_handler(CommandHandler("scan", scan_command))
+    application.add_handler(CommandHandler("watch", watch_command))
+    application.add_handler(CommandHandler("stop", stop_command))
+
+    application.add_handler(
+        CallbackQueryHandler(button_callback)
+    )
+
+    logging.info("SEIRANBOT запускается...")
+    application.run_polling()
+
+
+if __name__ == "__main__":
+    main()
