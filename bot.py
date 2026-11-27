@@ -414,13 +414,23 @@ def format_market_message(result: dict) -> str:
 # TELEGRAM UI
 # ============================================================
 
+Python
+
 def main_keyboard():
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("📊 Получить сигнал", callback_data="signal")],
-        [InlineKeyboardButton("🔎 Сканировать Forex", callback_data="scan")],
-        [InlineKeyboardButton("💱 Валютные пары", callback_data="symbols"),
-         InlineKeyboardButton("ℹ️ Помощь", callback_data="help")],
-    ])
+    return ReplyKeyboardMarkup(
+        [
+            ["💱 Пары", "🎯 Точность"],
+            ["⏱ Таймфрейм", "⌛ Экспирация"],
+            ["▶️ Включить", "⏸ Выключить"],
+            ["📂 Активы", "💹 Торговля"],
+            ["📡 Связь", "📊 Сигнал"],
+            ["🕯 График свечей"],
+            ["🔎 Анализ рынка"],
+        ],
+        resize_keyboard=True,
+        is_persistent=True,
+    )
+    
 
 
 def symbols_keyboard():
