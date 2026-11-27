@@ -749,15 +749,15 @@ async def menu_text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
     elif text == "📡 Связь":
-    symbol = context.user_data.get("selected_symbol", "EUR/USD")
-    interval = context.user_data.get("selected_interval", "5m")
-
-    status = await message.reply_text(
-        "⏳ Проверяю соединение с Twelve Data...\n"
-        f"Пара: {symbol}\n"
-        f"Таймфрейм: {interval}"
-    )
-
+        symbol = context.user_data.get("selected_symbol", "EUR/USD")
+        interval = context.user_data.get("selected_interval", "5m")
+        
+        status = await message.reply_text(
+            "⏳ Проверяю соединение с Twelve Data...\n"
+            f"Пара: {symbol}\n"
+            f"Таймфрейм: {interval}"
+        )
+    
     try:
         data = await asyncio.to_thread(
             _fetch_twelve_data, symbol, interval
