@@ -685,7 +685,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"Выбрана пара {symbol}. Выбери таймфрейм:",
                 reply_markup=intervals_keyboard(symbol)
             )
-
+            
         elif data.startswith("tf:"):
         parts = data.split(":", 2)
         if len(parts) == 3 and query.message:
