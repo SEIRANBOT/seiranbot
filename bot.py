@@ -672,7 +672,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=symbols_keyboard()
         )
 
-    Python
+    
     elif data.startswith("pair:"):
         symbol = data.split(":", 1)[1]
         if symbol in FOREX_SYMBOLS:
