@@ -672,11 +672,8 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=symbols_keyboard()
         )
 
-    elif data == "scan":
-        if query.message:
-            await run_scan(query.message)
-
-        elif data.startswith("pair:"):
+    Python
+    elif data.startswith("pair:"):
         symbol = data.split(":", 1)[1]
         if symbol in FOREX_SYMBOLS:
             context.user_data["selected_symbol"] = symbol
@@ -684,8 +681,8 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"Выбрана пара {symbol}. Выбери таймфрейм:",
                 reply_markup=intervals_keyboard(symbol)
             )
-            
-        elif data.startswith("tf:"):
+
+    elif data.startswith("tf:"):
         parts = data.split(":", 2)
         if len(parts) == 3 and query.message:
             context.user_data["selected_symbol"] = parts[1]
