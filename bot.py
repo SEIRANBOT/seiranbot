@@ -686,9 +686,11 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 reply_markup=intervals_keyboard(symbol)
             )
 
-    elif data.startswith("tf:"):
+        elif data.startswith("tf:"):
         parts = data.split(":", 2)
         if len(parts) == 3 and query.message:
+            context.user_data["selected_symbol"] = parts[1]
+            context.user_data["selected_interval"] = parts[2]
             await send_analysis(query.message, parts[1], parts[2])
     
 
