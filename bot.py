@@ -691,6 +691,71 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await send_analysis(query.message, parts[1], parts[2])
     
 
+async def menu_text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    message = update.effective_message
+    if not message or not message.text:
+        return
+
+    text = message.text.strip()
+
+    if text == "💱 Пары" or text == "📂 Активы":
+        await message.reply_text(
+            "💱 Выбери валютную пару:",
+            reply_markup=symbols_keyboard()
+        )
+
+    elif text == "📊 Сигнал" or text == "🔎 Анализ рынка":
+        await message.reply_text(
+            "📊 Выбери валютную пару для анализа:",
+            reply_markup=symbols_keyboard()
+        )
+
+    elif text == "⏱ Таймфрейм":
+        symbol = context.user_data.get("selected_symbol")
+        if symbol:
+            await message.reply_text(
+                f"⏱ Выбери таймфрейм для {symbol}:",
+                reply_markup=intervals_keyboard(symbol)
+            )
+        else:
+            await message.reply_text(
+                "Сначала выбери валютную пару:",
+                reply_markup=symbols_keyboard()
+            )
+
+    elif text == "⏸ Выключить":
+        await stop_command(update, context)
+
+    elif text == "▶️ Включить":
+        await message.reply_text(
+            "Сначала выбери валютную пару и таймфрейм."
+        )
+
+    elif text == "🎯 Точность":
+        await message.reply_text(
+            "🎯 Статистика точности будет доступна после накопления результатов сигналов."
+        )
+
+    elif text == "⌛ Экспирация":
+        await message.reply_text(
+            "⌛ Сейчас основной период анализа — выбранный таймфрейм. Настройку экспирации добавим отдельно."
+        )
+
+    elif text == "💹 Торговля":
+        await message.reply_text(
+            "💹 Режим ручной торговли. Бот анализирует рынок и не открывает сделки самостоятельно."
+        )
+
+    elif text == "📡 Связь":
+        await message.reply_text(
+            "📡 Источник котировок: Twelve Data. Проверку соединения добавим отдельно."
+        )
+
+    elif text == "🕯 График свечей":
+        await message.reply_text(
+            "🕯 Подключение графика реальных свечей будет следующим этапом."
+        )
+
 def main():
     if not BOT_TOKEN:
         raise RuntimeError("Не задан BOT_TOKEN")
