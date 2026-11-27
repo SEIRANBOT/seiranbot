@@ -677,9 +677,10 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if query.message:
             await run_scan(query.message)
 
-    elif data.startswith("pair:"):
+        elif data.startswith("pair:"):
         symbol = data.split(":", 1)[1]
         if symbol in FOREX_SYMBOLS:
+            context.user_data["selected_symbol"] = symbol
             await query.edit_message_text(
                 f"Выбрана пара {symbol}. Выбери таймфрейм:",
                 reply_markup=intervals_keyboard(symbol)
