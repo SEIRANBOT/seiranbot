@@ -748,8 +748,6 @@ async def menu_text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "💹 Режим ручной торговли. Бот анализирует рынок и не открывает сделки самостоятельно."
         )
 
-    Python
-
     elif text == "📡 Связь":
     symbol = context.user_data.get("selected_symbol", "EUR/USD")
     interval = context.user_data.get("selected_interval", "5m")
@@ -775,16 +773,17 @@ async def menu_text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"Последняя цена: {_price(latest_price, symbol)}\n"
             f"Последняя свеча UTC: "
             f"{candle_time.strftime('%Y-%m-%d %H:%M')}\n\n"
+            Python
             "✅ Данные получены успешно."
         )
 
-    except Exception as exc:
-        logger.exception("Twelve Data connection check failed")
+        except Exception as exc:
+            logger.exception("Twelve Data connection check failed")
 
-        await status.edit_text(
-            "🔴 ОШИБКА СОЕДИНЕНИЯ С TWELVE DATA\n\n"
-            f"Причина: {str(exc)[:500]}"
-        )
+            await status.edit_text(
+                "🔴 ОШИБКА СОЕДИНЕНИЯ С TWELVE DATA\n\n"
+                f"Причина: {str(exc)[:500]}"
+            )
         
         
     elif text == "🕯 График свечей":
