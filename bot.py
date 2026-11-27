@@ -748,11 +748,45 @@ async def menu_text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "💹 Режим ручной торговли. Бот анализирует рынок и не открывает сделки самостоятельно."
         )
 
-    elif text == "📡 Связь":
-        await message.reply_text(
-            "📡 Источник котировок: Twelve Data. Проверку соединения добавим отдельно."
+    Python
+
+elif text == "📡 Связь":
+    symbol = context.user_data.get("selected_symbol", "EUR/USD")
+    interval = context.user_data.get("selected_interval", "5m")
+
+    status = await message.reply_text(
+        "⏳ Проверяю соединение с Twelve Data...\n"
+        f"Пара: {symbol}\n"
+        f"Таймфрейм: {interval}"
+    )
+
+    try:
+        data = await asyncio.to_thread(
+            _fetch_twelve_data, symbol, interval
         )
 
+        latest_price = float(data["Close"].iloc[-1])
+        candle_time = data.index[-1]
+
+        await status.edit_text(
+            "🟢 СВЯЗЬ С TWELVE DATA РАБОТАЕТ\n\n"
+            f"Пара: {symbol}\n"
+            f"Таймфрейм: {interval}\n"
+            f"Последняя цена: {_price(latest_price, symbol)}\n"
+            f"Последняя свеча UTC: "
+            f"{candle_time.strftime('%Y-%m-%d %H:%M')}\n\n"
+            "✅ Данные получены успешно."
+        )
+
+    except Exception as exc:
+        logger.exception("Twelve Data connection check failed")
+
+        await status.edit_text(
+            "🔴 ОШИБКА СОЕДИНЕНИЯ С TWELVE DATA\n\n"
+            f"Причина: {str(exc)[:500]}"
+        )
+        
+        
     elif text == "🕯 График свечей":
         await message.reply_text(
             "🕯 Подключение графика реальных свечей будет следующим этапом."
