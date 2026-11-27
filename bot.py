@@ -750,7 +750,7 @@ async def menu_text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     Python
 
-elif text == "📡 Связь":
+    elif text == "📡 Связь":
     symbol = context.user_data.get("selected_symbol", "EUR/USD")
     interval = context.user_data.get("selected_interval", "5m")
 
