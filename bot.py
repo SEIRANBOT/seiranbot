@@ -414,7 +414,6 @@ def format_market_message(result: dict) -> str:
 # TELEGRAM UI
 # ============================================================
 
-Python
 
 def main_keyboard():
     return ReplyKeyboardMarkup(
