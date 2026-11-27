@@ -689,7 +689,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parts = data.split(":", 2)
         if len(parts) == 3 and query.message:
             await send_analysis(query.message, parts[1], parts[2])
-
+    
 
 def main():
     if not BOT_TOKEN:
