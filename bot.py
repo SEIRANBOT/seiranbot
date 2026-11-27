@@ -758,33 +758,31 @@ async def menu_text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"Таймфрейм: {interval}"
         )
     
-    try:
-        data = await asyncio.to_thread(
-            _fetch_twelve_data, symbol, interval
-        )
+        try:
+            data = await asyncio.to_thread(
+                _fetch_twelve_data, symbol, interval
+            )
 
-        latest_price = float(data["Close"].iloc[-1])
-        candle_time = data.index[-1]
-
-        await status.edit_text(
+            latest_price = float(data["Close"].iloc[-1])
+            candle_time = data.index[-1]
+                   await status.edit_text(
             "🟢 СВЯЗЬ С TWELVE DATA РАБОТАЕТ\n\n"
             f"Пара: {symbol}\n"
             f"Таймфрейм: {interval}\n"
             f"Последняя цена: {_price(latest_price, symbol)}\n"
             f"Последняя свеча UTC: "
             f"{candle_time.strftime('%Y-%m-%d %H:%M')}\n\n"
-            Python
+    
             "✅ Данные получены успешно."
         )
 
         except Exception as exc:
             logger.exception("Twelve Data connection check failed")
 
-            await status.edit_text(
+           await status.edit_text(
                 "🔴 ОШИБКА СОЕДИНЕНИЯ С TWELVE DATA\n\n"
                 f"Причина: {str(exc)[:500]}"
-            )
-        
+               )
         
     elif text == "🕯 График свечей":
         await message.reply_text(
