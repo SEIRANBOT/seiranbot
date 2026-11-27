@@ -28,7 +28,7 @@ TWELVE_DATA_API_KEY = os.getenv("TWELVE_DATA_API_KEY", "").strip()
 POLL_SECONDS = max(60, int(os.getenv("POLL_SECONDS", "60")))
 SCAN_LIMIT = max(1, min(2, int(os.getenv("SCAN_LIMIT", "2"))))
 MIN_SCORE = max(2, min(4, int(os.getenv("MIN_SCORE", "3"))))
-CACHE_TTL_SECONDS = max(15, int(os.getenv("CACHE_TTL_SECONDS", "60")))
+CACHE_TTL_SECONDS = max(15, int(os.getenv("CACHE_TTL_SECONDS", "120")))
 REQUEST_TIMEOUT = max(5, int(os.getenv("REQUEST_TIMEOUT", "20")))
 
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
