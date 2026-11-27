@@ -775,7 +775,7 @@ def main():
     application.add_handler(CommandHandler("unwatch", stop_command))
 
     application.add_handler(CallbackQueryHandler(button_callback))
-
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, menu_text_handler))
     logging.info("SEIRANBOT запускается...")
     application.run_polling()
 
