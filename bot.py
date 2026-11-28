@@ -765,8 +765,8 @@ async def menu_text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
             latest_price = float(data["Close"].iloc[-1])
             candle_time = data.index[-1]
-                   await status.edit_text(
-            "🟢 СВЯЗЬ С TWELVE DATA РАБОТАЕТ\n\n"
+        await status.edit_text(
+                "🟢 СВЯЗЬ С TWELVE DATA РАБОТАЕТ\n\n"
             f"Пара: {symbol}\n"
             f"Таймфрейм: {interval}\n"
             f"Последняя цена: {_price(latest_price, symbol)}\n"
