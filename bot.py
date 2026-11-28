@@ -775,14 +775,13 @@ async def menu_text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
             "✅ Данные получены успешно."
         )
-
         except Exception as exc:
             logger.exception("Twelve Data connection check failed")
 
-           await status.edit_text(
+            await status.edit_text(
                 "🔴 ОШИБКА СОЕДИНЕНИЯ С TWELVE DATA\n\n"
                 f"Причина: {str(exc)[:500]}"
-               )
+)
         
     elif text == "🕯 График свечей":
         await message.reply_text(
